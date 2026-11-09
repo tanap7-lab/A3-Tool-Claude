@@ -160,11 +160,11 @@ BEGIN
   IF st.state = 'closed' THEN
     RAISE EXCEPTION 'A3_ALREADY_CLOSED|Step % is already closed.', st.letter;
   END IF;
-  IF btrim(st.plain_text) = '' THEN
-    RAISE EXCEPTION 'A3_STEP_EMPTY|Step % has no text yet, so it cannot close.', st.letter;
-  END IF;
   IF EXISTS (SELECT 1 FROM a3_step WHERE sheet_id = st.sheet_id AND letter < st.letter AND state = 'open') THEN
     RAISE EXCEPTION 'A3_STEP_ORDER|Steps close in order A, B, C, D. Close the earlier steps first.';
+  END IF;
+  IF btrim(st.plain_text) = '' THEN
+    RAISE EXCEPTION 'A3_STEP_EMPTY|Step % has no text yet, so it cannot close.', st.letter;
   END IF;
   UPDATE a3_step
      SET state = 'closed', closed_at = now(), closed_by = me, locked_by = NULL, locked_at = NULL

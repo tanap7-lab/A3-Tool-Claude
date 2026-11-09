@@ -1,0 +1,47 @@
+<!doctype html>
+<!--
+  The small static page behind D2: email and chat tools may strip a3sheet:// links, but they pass https:// ones.
+  Host this at your link base address so that every path under it serves this file, for example
+  https://links.example.com/a3/A3-2026-0042, then set that address in Settings > Admin > Link base address.
+  It holds no data. It only forwards a link that passes the same strict pattern the app uses (FR-LNK-04).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>Opening A3 Sheet</title>
+<style>
+  :root { color-scheme: light; }
+  body { margin: 0; padding: 48px 16px; background: #F8F9FA; color: #202124; font: 14px/1.5 Roboto, "Segoe UI", Arial, sans-serif; }
+  main { max-width: 480px; margin: 0 auto; padding: 24px; background: #fff; border: 1px solid #DADCE0; border-radius: 8px; }
+  h1 { margin: 0 0 8px; font-size: 22px; font-weight: 400; }
+  a { color: #1A73E8; }
+  code { background: #F8F9FA; padding: 2px 6px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Opening A3 Sheet...</h1>
+  <p id="body">If nothing happens, <a id="open" href="#">open it here</a>.</p>
+  <p id="fallback" hidden>Don't have the app? Ask a colleague for an export of <code id="id"></code>.</p>
+</main>
+<script>
+  (function () {
+    var m = location.pathname.match(/\/(a3)\/(A3-\d{4}-\d{4,6})\/?$/) ||
+      location.pathname.match(/\/(warning)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/);
+    if (!m) {
+      document.getElementById('title').textContent = 'This link is not valid';
+      document.getElementById('body').hidden = true;
+      return;
+    }
+    var target = 'a3sheet://' + m[1] + '/' + m[2];
+    document.getElementById('open').href = target;
+    document.getElementById('id').textContent = m[2];
+    document.getElementById('fallback').hidden = false;
+    location.href = target;
+  })();
+</script>
+</body>
+</html>

@@ -23,11 +23,11 @@ const WARNING_COLUMNS: &str = "w.id, w.sheet_id, sh.number AS sheet_number, sh.t
     (SELECT count(*) FROM follow_up_task t WHERE t.warning_id = w.id AND t.result = 'Not applicable') AS not_applicable,
     (SELECT count(*) FROM warning_read_state r WHERE r.warning_id = w.id AND NOT r.unread AND r.read_at IS NOT NULL) AS read_count";
 
-fn base<'a>(me: Uuid) -> QueryBuilder<'a, Postgres> {
+fn base(me: Uuid) -> QueryBuilder<Postgres> {
     let mut q: QueryBuilder<Postgres> = QueryBuilder::new(format!("SELECT {WARNING_COLUMNS} FROM early_warning w
         JOIN a3_sheet sh ON sh.id = w.sheet_id
         JOIN app_user u ON u.id = w.author_id
-        LEFT JOIN warning_read_state rs ON rs.warning_id = w.id AND rs.user_id = ").as_str().to_owned());
+        LEFT JOIN warning_read_state rs ON rs.warning_id = w.id AND rs.user_id = "));
     q.push_bind(me);
     q
 }
@@ -172,8 +172,8 @@ impl WallRepo for PgRepository {
     async fn tasks_for_warning(&self, warning: Uuid) -> Result<Vec<Task>> {
         Ok(sqlx::query_as!(
             Task,
-            r#"SELECT t.id, t.warning_id, w.headline AS warning_headline, t.description, t.assignee_id, u.display_name AS assignee_name,
-                      t.target_area, t.due_on, t.result, t.closed_at, t.linked_a3_id, sh.number AS "linked_a3_number?"
+            r#"SELECT t.id AS "id!", t.warning_id AS "warning_id!", w.headline AS "warning_headline!", t.description AS "description!", t.assignee_id AS "assignee_id!", u.display_name AS "assignee_name!",
+                      t.target_area AS "target_area!", t.due_on, t.result, t.closed_at, t.linked_a3_id, sh.number AS "linked_a3_number?"
                FROM follow_up_task t
                JOIN early_warning w ON w.id = t.warning_id
                JOIN app_user u ON u.id = t.assignee_id

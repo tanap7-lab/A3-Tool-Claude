@@ -1,6 +1,6 @@
 use super::sheets::fetch_step;
 use super::users::require_row;
-use super::{AiRepo, PgRepository, UserRepo};
+use super::{AiRepo, PgRepository};
 use crate::error::{CoreError, Result};
 use crate::model::*;
 use crate::richtext;
@@ -270,7 +270,7 @@ impl AiRepo for PgRepository {
     async fn messages(&self, sheet: Uuid) -> Result<Vec<AiMessage>> {
         Ok(sqlx::query_as!(
             AiMessage,
-            r#"SELECT m.id, m.role, m.text, m.sources, u.display_name AS "user_name?", m.created_at
+            r#"SELECT m.id AS "id!", m.role AS "role!", m.text AS "text!", m.sources AS "sources!", u.display_name AS "user_name?", m.created_at AS "created_at!"
                FROM ai_message m LEFT JOIN app_user u ON u.id = m.user_id
                WHERE m.sheet_id = $1 ORDER BY m.created_at, m.id"#,
             sheet

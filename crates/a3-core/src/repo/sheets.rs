@@ -6,7 +6,7 @@ use crate::model::*;
 use crate::richtext;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use sqlx::{AssertSqlSafe, Postgres, QueryBuilder};
+use sqlx::{Postgres, QueryBuilder};
 use uuid::Uuid;
 
 pub(super) const PAGE_SIZE: i64 = 50;
@@ -20,7 +20,7 @@ pub(super) const ROW_SELECT: &str = "SELECT sh.id, sh.number, sh.title, sh.proje
     JOIN project p ON p.id = sh.project_id
     JOIN app_user u ON u.id = sh.owner_id";
 
-fn push_filters<'a>(q: &mut QueryBuilder<'a, Postgres>, f: &'a SheetFilter, me: Uuid) {
+fn push_filters(q: &mut QueryBuilder<Postgres>, f: &SheetFilter, me: Uuid) {
     q.push(" WHERE true");
     match f.quick.as_deref() {
         Some("open") => { q.push(" AND v.status = 'Open' AND NOT v.withdrawn"); }
@@ -37,11 +37,11 @@ fn push_filters<'a>(q: &mut QueryBuilder<'a, Postgres>, f: &'a SheetFilter, me: 
     }
     if let Some(v) = f.project_id { q.push(" AND sh.project_id = ").push_bind(v); }
     if let Some(v) = f.owner_id { q.push(" AND sh.owner_id = ").push_bind(v); }
-    if let Some(v) = &f.category { q.push(" AND sh.category = ").push_bind(v); }
-    if let Some(v) = &f.area { q.push(" AND sh.area = ").push_bind(v); }
+    if let Some(v) = &f.category { q.push(" AND sh.category = ").push_bind(v.clone()); }
+    if let Some(v) = &f.area { q.push(" AND sh.area = ").push_bind(v.clone()); }
     if let Some(v) = f.from { q.push(" AND sh.registered_on >= ").push_bind(v); }
     if let Some(v) = f.to { q.push(" AND sh.registered_on <= ").push_bind(v); }
-    if let Some(v) = &f.current_step { q.push(" AND v.current_step = ").push_bind(v); }
+    if let Some(v) = &f.current_step { q.push(" AND v.current_step = ").push_bind(v.clone()); }
     if let Some(v) = f.closed_from { q.push(" AND v.closed_at >= ").push_bind(v); }
     match f.age_band.as_deref() {
         Some("0-30") => { q.push(" AND CURRENT_DATE - sh.registered_on BETWEEN 0 AND 30"); }
@@ -53,7 +53,7 @@ fn push_filters<'a>(q: &mut QueryBuilder<'a, Postgres>, f: &'a SheetFilter, me: 
     if f.reopened_from.is_some() || f.reopen_reason.is_some() {
         q.push(" AND EXISTS (SELECT 1 FROM audit_event ae WHERE ae.sheet_id = sh.id AND ae.action = 'step_reopened'");
         if let Some(v) = f.reopened_from { q.push(" AND ae.at >= ").push_bind(v); }
-        if let Some(v) = &f.reopen_reason { q.push(" AND ae.reason = ").push_bind(v); }
+        if let Some(v) = &f.reopen_reason { q.push(" AND ae.reason = ").push_bind(v.clone()); }
         q.push(")");
     }
     if let Some(s) = f.search.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -61,9 +61,9 @@ fn push_filters<'a>(q: &mut QueryBuilder<'a, Postgres>, f: &'a SheetFilter, me: 
         let like = format!("%{}%", s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
         q.push(" AND (sh.title ILIKE ").push_bind(like.clone());
         q.push(" OR sh.number ILIKE ").push_bind(like);
-        q.push(" OR sh.search @@ websearch_to_tsquery('english', ").push_bind(s).push(")");
-        q.push(" OR EXISTS (SELECT 1 FROM a3_step st WHERE st.sheet_id = sh.id AND st.search @@ websearch_to_tsquery('english', ").push_bind(s).push("))");
-        q.push(" OR EXISTS (SELECT 1 FROM source_segment seg JOIN attachment a ON a.id = seg.attachment_id WHERE a.sheet_id = sh.id AND a.deleted_at IS NULL AND seg.search @@ websearch_to_tsquery('english', ").push_bind(s).push(")))");
+        q.push(" OR sh.search @@ websearch_to_tsquery('english', ").push_bind(s.to_string()).push(")");
+        q.push(" OR EXISTS (SELECT 1 FROM a3_step st WHERE st.sheet_id = sh.id AND st.search @@ websearch_to_tsquery('english', ").push_bind(s.to_string()).push("))");
+        q.push(" OR EXISTS (SELECT 1 FROM source_segment seg JOIN attachment a ON a.id = seg.attachment_id WHERE a.sheet_id = sh.id AND a.deleted_at IS NULL AND seg.search @@ websearch_to_tsquery('english', ").push_bind(s.to_string()).push(")))");
     }
 }
 
@@ -97,7 +97,7 @@ impl SheetRepo for PgRepository {
         let mut q: QueryBuilder<Postgres> = QueryBuilder::new(ROW_SELECT);
         push_filters(&mut q, f, self.me.id);
         q.push(" ORDER BY ");
-        q.push(AssertSqlSafe(sort_column(f.sort.as_deref())));
+        q.push(sort_column(f.sort.as_deref()));
         q.push(if f.descending.unwrap_or(true) { " DESC NULLS LAST" } else { " ASC NULLS LAST" });
         q.push(", sh.number DESC LIMIT ").push_bind(PAGE_SIZE);
         q.push(" OFFSET ").push_bind(page * PAGE_SIZE);
@@ -129,10 +129,10 @@ impl SheetRepo for PgRepository {
         .ok_or_else(|| CoreError::not_found("A3"))?;
         let steps = sqlx::query_as!(
             Step,
-            r#"SELECT st.id, st.sheet_id, st.letter, st.content, st.plain_text, st.state, st.closed_at, st.version, st.reopen_count,
+            r#"SELECT st.id AS "id!", st.sheet_id AS "sheet_id!", st.letter AS "letter!", st.content AS "content!", st.plain_text AS "plain_text!", st.state AS "state!", st.closed_at, st.version AS "version!", st.reopen_count AS "reopen_count!",
                       CASE WHEN st.locked_at > now() - interval '2 minutes' THEN st.locked_by END AS locked_by,
                       CASE WHEN st.locked_at > now() - interval '2 minutes' THEN u.display_name END AS locked_by_name,
-                      st.locked_at, st.updated_at
+                      st.locked_at, st.updated_at AS "updated_at!"
                FROM a3_step st LEFT JOIN app_user u ON u.id = st.locked_by
                WHERE st.sheet_id = $1 ORDER BY st.letter"#,
             id
@@ -157,8 +157,8 @@ impl SheetRepo for PgRepository {
     async fn create_sheet(&self, n: &NewSheet) -> Result<Uuid> {
         check_title(&n.title)?;
         let id = sqlx::query_scalar!(
-            "INSERT INTO a3_sheet (title, project_id, owner_id, problem_date, target_close_date, category, severity, source, area, product, origin_warning_id, origin_task_id, number)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, '') RETURNING id",
+            "INSERT INTO a3_sheet (title, project_id, owner_id, problem_date, target_close_date, category, severity, source, area, product, origin_warning_id, origin_task_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
             n.title.trim(), n.project_id, self.me.id, n.problem_date, n.target_close_date,
             n.category, n.severity, n.source, n.area, n.product, n.origin_warning_id, n.origin_task_id
         )
@@ -234,7 +234,7 @@ impl SheetRepo for PgRepository {
     }
 
     async fn acquire_lock(&self, step: Uuid) -> Result<Step> {
-        sqlx::query!("SELECT acquire_step_lock($1)", step).execute(&self.pool).await?;
+        sqlx::query!("SELECT acquire_step_lock($1)", step).fetch_one(&self.pool).await?;
         fetch_step(&self.pool, step).await
     }
 
@@ -256,7 +256,7 @@ impl SheetRepo for PgRepository {
     async fn snapshots(&self, sheet: Uuid) -> Result<Vec<Snapshot>> {
         Ok(sqlx::query_as!(
             Snapshot,
-            r#"SELECT sn.id, sn.step_id, sn.letter, sn.content, sn.plain_text, sn.version, u.display_name AS "author_name?", sn.reason, sn.created_at
+            r#"SELECT sn.id AS "id!", sn.step_id AS "step_id!", sn.letter AS "letter!", sn.content AS "content!", sn.plain_text AS "plain_text!", sn.version AS "version!", u.display_name AS "author_name?", sn.reason AS "reason!", sn.created_at AS "created_at!"
                FROM a3_step_snapshot sn LEFT JOIN app_user u ON u.id = sn.author_id
                WHERE sn.sheet_id = $1 ORDER BY sn.created_at DESC LIMIT 200"#,
             sheet
@@ -273,7 +273,7 @@ impl SheetRepo for PgRepository {
     async fn history(&self, sheet: Uuid) -> Result<Vec<AuditRow>> {
         Ok(sqlx::query_as!(
             AuditRow,
-            r#"SELECT e.id, u.display_name AS "actor_name?", e.object_type, e.action, e.reason, e.detail, e.at
+            r#"SELECT e.id AS "id!", u.display_name AS "actor_name?", e.object_type AS "object_type!", e.action AS "action!", e.reason, e.detail AS "detail!", e.at AS "at!"
                FROM audit_event e LEFT JOIN app_user u ON u.id = e.actor_id
                WHERE e.sheet_id = $1 ORDER BY e.at DESC, e.id DESC LIMIT 500"#,
             sheet
@@ -309,10 +309,10 @@ where
 {
     Ok(sqlx::query_as!(
         Step,
-        r#"SELECT st.id, st.sheet_id, st.letter, st.content, st.plain_text, st.state, st.closed_at, st.version, st.reopen_count,
+        r#"SELECT st.id AS "id!", st.sheet_id AS "sheet_id!", st.letter AS "letter!", st.content AS "content!", st.plain_text AS "plain_text!", st.state AS "state!", st.closed_at, st.version AS "version!", st.reopen_count AS "reopen_count!",
                   CASE WHEN st.locked_at > now() - interval '2 minutes' THEN st.locked_by END AS locked_by,
                   CASE WHEN st.locked_at > now() - interval '2 minutes' THEN u.display_name END AS locked_by_name,
-                  st.locked_at, st.updated_at
+                  st.locked_at, st.updated_at AS "updated_at!"
            FROM a3_step st LEFT JOIN app_user u ON u.id = st.locked_by
            WHERE st.id = $1"#,
         step

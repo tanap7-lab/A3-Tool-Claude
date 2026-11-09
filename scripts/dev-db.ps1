@@ -40,7 +40,7 @@ if ($fresh) {
   [IO.File]::WriteAllText($pw, $super)
   & "$bin\initdb.exe" -D $data -U postgres --pwfile=$pw --auth=scram-sha-256 -E UTF8 --locale=C | Out-Null
   Remove-Item -Force $pw
-  Add-Content (Join-Path $data 'postgresql.conf') "port = $port`nlisten_addresses = 'localhost'`nlogging_collector = off`n"
+  Add-Content (Join-Path $data 'postgresql.conf') "port = $port`nlisten_addresses = 'localhost'`nlogging_collector = off`nmax_connections = 300`n"
   $lines = @(
     "PGSUPERPASS=$super",
     "PGOWNERPASS=$owner",

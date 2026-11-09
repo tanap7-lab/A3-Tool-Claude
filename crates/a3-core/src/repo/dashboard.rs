@@ -20,8 +20,8 @@ impl DashboardRepo for PgRepository {
 
         let my_tasks = sqlx::query_as!(
             Task,
-            r#"SELECT t.id, t.warning_id, w.headline AS warning_headline, t.description, t.assignee_id, u.display_name AS assignee_name,
-                      t.target_area, t.due_on, t.result, t.closed_at, t.linked_a3_id, sh.number AS "linked_a3_number?"
+            r#"SELECT t.id AS "id!", t.warning_id AS "warning_id!", w.headline AS "warning_headline!", t.description AS "description!", t.assignee_id AS "assignee_id!", u.display_name AS "assignee_name!",
+                      t.target_area AS "target_area!", t.due_on, t.result, t.closed_at, t.linked_a3_id, sh.number AS "linked_a3_number?"
                FROM follow_up_task t
                JOIN early_warning w ON w.id = t.warning_id
                JOIN app_user u ON u.id = t.assignee_id
@@ -71,7 +71,7 @@ impl DashboardRepo for PgRepository {
         // Overdue and Stalled lists, oldest first.
         let list = |flag: &'static str| {
             let mut q: QueryBuilder<Postgres> = QueryBuilder::new(ROW_SELECT);
-            q.push(" WHERE ").push(sqlx::AssertSqlSafe(flag));
+            q.push(" WHERE ").push(flag);
             if let Some(p) = f.project_id {
                 q.push(" AND sh.project_id = ").push_bind(p);
             }
