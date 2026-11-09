@@ -1,0 +1,9 @@
+node_modules/
+dist/
+target/
+.dev/
+*.log
+.env
+src-tauri/gen/
+test-results/
+playwright-report/
