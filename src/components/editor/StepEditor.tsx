@@ -4,7 +4,7 @@ import { EditorContent, useEditor, type Editor } from '@tiptap/react';
 import { useQueryClient } from '@tanstack/react-query';
 import { call, errorCode, STEP_HINTS, type Step } from '../../api';
 import { useApp } from '../../context';
-import { replaceSentence, type DocNode } from '../../lib/doc';
+import { replaceSentence, sameDocument, type DocNode } from '../../lib/doc';
 import { tokens } from '../../theme';
 import { Icon } from '../common';
 import { imageFileToDataUrl, stepExtensions } from './extensions';
@@ -16,6 +16,8 @@ export interface StepEditorHandle {
   /** Waits until typed text has reached the database. */
   flush: () => Promise<void>;
   applySuggestion: (original: string, rewrite: string) => boolean;
+  matchesSummary: (original: DocNode, version: number) => boolean;
+  loadSavedStep: (saved: Step) => void;
   selectedText: () => string;
   html: () => string;
 }
@@ -25,6 +27,8 @@ interface Props {
   canEdit: boolean;
   onOpenSource: (segmentId: string) => void;
   onImprove?: (selection: string | null) => void;
+  aiBusy?: boolean;
+  applyingSummary?: boolean;
   onHtmlChange?: (html: string) => void;
   fill?: boolean;
 }
@@ -34,7 +38,7 @@ interface Props {
  * while focused (FR-A3-07), refuses stale saves (FR-A3-08), and keeps text in a local recovery file
  * whenever the database cannot be reached (section 15).
  */
-export const StepEditor = forwardRef<StepEditorHandle, Props>(function StepEditor({ step, canEdit, onOpenSource, onImprove, onHtmlChange, fill }, ref) {
+export const StepEditor = forwardRef<StepEditorHandle, Props>(function StepEditor({ step, canEdit, onOpenSource, onImprove, aiBusy, applyingSummary, onHtmlChange, fill }, ref) {
   const { user } = useApp();
   const qc = useQueryClient();
   const versionRef = useRef(step.version);
@@ -49,7 +53,7 @@ export const StepEditor = forwardRef<StepEditorHandle, Props>(function StepEdito
   const [recovery, setRecovery] = useState<{ content: DocNode; version: number } | null>(null);
   const [lockedBy, setLockedBy] = useState<string | null>(step.lockedBy && step.lockedBy !== user.id ? step.lockedByName : null);
 
-  const editable = canEdit && step.state === 'open' && !lockedBy && !conflict;
+  const editable = canEdit && step.state === 'open' && !lockedBy && !conflict && !applyingSummary;
 
   const saveOnce = useCallback(async () => {
     const editor = editorRef.current;
@@ -224,6 +228,16 @@ export const StepEditor = forwardRef<StepEditorHandle, Props>(function StepEdito
         void save();
         return true;
       },
+      matchesSummary: (original, version) => !!editor && versionRef.current === version && !dirtyRef.current && sameDocument(editor.getJSON(), original),
+      loadSavedStep: (saved) => {
+        if (!editor || saved.id !== step.id) return;
+        versionRef.current = saved.version;
+        dirtyRef.current = false;
+        if (timerRef.current) window.clearTimeout(timerRef.current);
+        editor.commands.setContent(saved.content as DocNode, { emitUpdate: false });
+        onHtmlChange?.(editor.getHTML());
+        setSaving('saved');
+      },
       selectedText: () => {
         if (!editor) return '';
         const { from, to } = editor.state.selection;
@@ -231,7 +245,7 @@ export const StepEditor = forwardRef<StepEditorHandle, Props>(function StepEdito
       },
       html: () => editor?.getHTML() ?? '',
     }),
-    [editor, save, onHtmlChange],
+    [editor, step.id, save, onHtmlChange],
   );
 
   const reloadLatest = async () => {
@@ -338,6 +352,7 @@ export const StepEditor = forwardRef<StepEditorHandle, Props>(function StepEdito
           {onImprove && (
             <Button
               size="small"
+              disabled={aiBusy}
               startIcon={<Icon name="auto_awesome" size={16} />}
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => {
@@ -365,4 +380,3 @@ export const StepEditor = forwardRef<StepEditorHandle, Props>(function StepEdito
     </Box>
   );
 });
-

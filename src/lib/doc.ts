@@ -8,6 +8,29 @@ export interface DocNode {
   content?: DocNode[];
 }
 
+export function storyParts(doc: DocNode): { story: DocNode[]; details: DocNode[] } {
+  const story: DocNode[] = [];
+  const details: DocNode[] = [];
+  for (const block of doc.content ?? []) {
+    if (block.type === 'a3Narrative') story.push(...(block.content ?? []));
+    else if (block.type === 'a3Evidence') details.push(...(block.content ?? []));
+    else details.push(block);
+  }
+  return { story, details };
+}
+
+/** Compares JSON documents without depending on object property order. */
+export function sameDocument(a: DocNode, b: DocNode): boolean {
+  const canonical = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value !== null && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, canonical(item)]));
+    }
+    return value;
+  };
+  return JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
+}
+
 /**
  * Applies an accepted rewrite (FR "Phrasing", section 9.4). Works inside one text node, keeping that
  * node's marks. A sourced sentence keeps its chip, marked edited (FR-A3-06). Returns null when the
@@ -39,6 +62,8 @@ export function plainText(doc: DocNode | undefined | null): string {
     if (n.type === 'text') out.push(n.text ?? '');
     else if (n.type === 'hardBreak') out.push('\n');
     else {
+      if (n.type === 'a3Narrative') out.push('At a glance\n');
+      if (n.type === 'a3Evidence') out.push('Supporting evidence and details\n');
       n.content?.forEach(walk);
       if (n.type === 'paragraph') out.push('\n');
     }

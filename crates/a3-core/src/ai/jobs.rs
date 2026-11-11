@@ -14,8 +14,9 @@ use crate::repo::Repository;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const MAX_TOKENS: u32 = 16_000;
@@ -37,6 +38,62 @@ pub struct Suggestion {
     pub original: String,
     pub rewrite: String,
     pub why: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct A3Summary {
+    pub steps: Vec<SummaryStep>,
+    pub note: Option<String>,
+    pub moves: Vec<SummaryMove>,
+    #[serde(default)]
+    pub tone: SummaryTone,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryTone {
+    #[default]
+    Plain,
+    Executive,
+    Technical,
+}
+
+impl SummaryTone {
+    pub fn instruction(self) -> &'static str {
+        match self {
+            Self::Plain => "Plain English: rewrite awkward notes substantially into natural, direct sentences with familiar words and a clear subject and verb. Split overloaded sentences and remove bureaucratic phrasing. Do more than swap a few synonyms.",
+            Self::Executive => "Executive briefing: lead with the issue, impact, decisions and action status. Use crisp, professional sentences and front-load the important point. Select the essentials for the short story; preserve the qualifications of selected claims. Complete evidence, owners and dates remain in the supporting details.",
+            Self::Technical => "Technical report: use precise, neutral engineering language and an evidence-to-conclusion structure. Make relationships explicit only where the input states them, retaining terminology, measurement conditions and uncertainty.",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryMove {
+    pub from: String,
+    pub to: String,
+    pub text: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SummaryStory {
+    text: String,
+    sources: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct SummaryPlacement {
+    letter: String,
+    blocks: Vec<String>,
+    story: Vec<SummaryStory>,
+}
+
+#[derive(Deserialize)]
+struct SummaryStoryEdit {
+    letter: String,
+    story: Vec<SummaryStory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +149,12 @@ struct RunLog {
 }
 
 impl RunLog {
+    fn absorb(&mut self, other: Self) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.discards.extend(other.discards);
+    }
+
     fn discard(&mut self, check: &str, detail: impl Into<String>) {
         // Check code and reason only. A3 text stays out of the run log.
         let d = detail.into();
@@ -130,7 +193,14 @@ impl AiService {
     async fn call_json<T: DeserializeOwned>(&self, req: CompletionRequest, log: &mut RunLog) -> Result<T> {
         let mut req = req;
         for attempt in 0..2 {
-            let c = self.provider.complete(&req).await?;
+            let c = match self.provider.complete(&req).await {
+                Err(e) if req.fast && e.code == "AI_TRUNCATED" && attempt == 0 && req.max_tokens < MAX_TOKENS => {
+                    log.discard("G2", "truncated bounded reply; retrying once with more output space");
+                    req.max_tokens = (req.max_tokens * 2).min(MAX_TOKENS);
+                    continue;
+                }
+                other => other?,
+            };
             log.input_tokens += c.input_tokens;
             log.output_tokens += c.output_tokens;
             match serde_json::from_str::<T>(extract_json(&c.text)) {
@@ -601,6 +671,270 @@ impl AiService {
         self.rewrites(sheet, letter, "condense", prompts::condense_system(target_chars), None, 200).await
     }
 
+    pub async fn summarize(&self, sheet: Uuid) -> Result<A3Summary> {
+        self.summarize_with_tone(sheet, SummaryTone::default()).await
+    }
+
+    pub async fn summarize_with_tone(&self, sheet: Uuid, tone: SummaryTone) -> Result<A3Summary> {
+        let started = Instant::now();
+        let ctx = context::build(self.repo.as_ref(), sheet, &ContextOptions { omit_step_text: true, ..Default::default() }).await?;
+        if !ctx.sheet.project_ai_enabled {
+            return Err(CoreError::new("AI_OFF", "AI is turned off for this project."));
+        }
+        if !ctx.sheet.can_edit || ctx.sheet.withdrawn_at.is_some() {
+            return Err(CoreError::ai("Only an editable A3 can be summarized."));
+        }
+        let mut nodes = BTreeMap::new();
+        let mut blocks = BTreeMap::new();
+        let mut outline = Vec::new();
+        let mut detail_docs = BTreeMap::new();
+        for step in &ctx.steps {
+            let details = if step.state == "closed" { step.content.clone() } else { crate::richtext::summary_evidence(&step.content) };
+            for (id, text) in crate::richtext::text_nodes(&details) {
+                nodes.insert(format!("{}.{id}", step.letter), text);
+            }
+            for (i, block) in details["content"].as_array().into_iter().flatten().enumerate() {
+                let id = format!("{}.{i}", step.letter);
+                let prefix = format!("{id}.");
+                let text: BTreeMap<_, _> = nodes.iter().filter(|(key, _)| key.starts_with(&prefix)).collect();
+                outline.push(json!({"block": id, "type": block["type"], "step_state": step.state, "text_nodes": text}));
+                blocks.insert(id, block.clone());
+            }
+            detail_docs.insert(step.letter.clone(), details);
+        }
+        if nodes.values().all(|text| text.trim().is_empty()) {
+            return Err(CoreError::ai("Add some text to this A3 before summarizing."));
+        }
+        #[derive(Deserialize)]
+        struct Rewrite {
+            node: String,
+            rewrite: String,
+        }
+        #[derive(Deserialize)]
+        struct Plan {
+            steps: Vec<SummaryPlacement>,
+            rewrites: Vec<Rewrite>,
+        }
+        let mut log = RunLog::default();
+        let result = tokio::time::timeout(Duration::from_secs(180), async {
+            let mut plan: Plan = self.call_json(
+                CompletionRequest {
+                    system: format!("{}\n\nRequested tone: {}", prompts::summarize_system(), tone.instruction()),
+                    user: format!("{}\nReview, summarize and organize the full A3 using these document blocks:\n{}", ctx.text, json!(outline)),
+                    schema: Some(prompts::summarize_schema()),
+                    max_tokens: MAX_TOKENS,
+                    fast: true,
+                    ..Default::default()
+                },
+                &mut log,
+            ).await?;
+            let mut rewrites = BTreeMap::new();
+            let mut seen_rewrites = HashSet::new();
+            let mut retained_details = 0;
+            for r in plan.rewrites {
+                let original = nodes.get(&r.node).ok_or_else(|| CoreError::ai("The AI referenced an unknown text node. Please try again."))?;
+                let text = r.rewrite.trim().to_string();
+                if !seen_rewrites.insert(r.node.clone()) || text.is_empty() {
+                    return Err(CoreError::ai("The AI returned repeated or empty text. Please try again."));
+                }
+                if text == *original {
+                    continue;
+                }
+                if ctx.step(r.node.split('.').next().unwrap_or("")).is_some_and(|s| s.state == "closed") {
+                    return Err(CoreError::ai("A proposed change affects a closed step. Reopen it before summarizing."));
+                }
+                if let Some(reason) = guard::phrasing_violation(original, &text) {
+                    log.discard("G5", format!("{}: {reason}", r.node));
+                    retained_details += 1;
+                    continue;
+                }
+                rewrites.insert(r.node, text);
+            }
+            let mut seen_steps = HashSet::new();
+            let mut seen_blocks = HashSet::new();
+            let mut steps = Vec::new();
+            let mut moves = Vec::new();
+            for placement in &plan.steps {
+                let step = ctx.step(&placement.letter).ok_or_else(|| CoreError::ai("The AI returned an unknown step."))?;
+                if !seen_steps.insert(placement.letter.clone()) {
+                    return Err(CoreError::ai("The AI repeated a step."));
+                }
+                let mut content = Vec::new();
+                for id in &placement.blocks {
+                    let block = blocks.get(id).ok_or_else(|| CoreError::ai("The AI referenced an unknown block."))?;
+                    if !seen_blocks.insert(id.clone()) {
+                        return Err(CoreError::ai("The AI repeated a document block."));
+                    }
+                    let from_letter = id.split('.').next().unwrap_or("");
+                    if from_letter != step.letter && ctx.step(from_letter).is_some_and(|s| s.state == "closed") {
+                        return Err(CoreError::ai("A proposed move changes a closed step. Reopen it before summarizing."));
+                    }
+                    if from_letter != step.letter {
+                        moves.push(SummaryMove { from: from_letter.into(), to: step.letter.clone(), text: crate::richtext::plain_text(&blocks[id]) });
+                    }
+                    content.push(block.clone());
+                }
+                let mut doc = step.content.clone();
+                doc["content"] = if content.is_empty() { json!([{"type": "paragraph"}]) } else { json!(content) };
+                if step.state == "closed" && doc != step.content {
+                    return Err(CoreError::ai("A proposed change affects a closed step. Reopen it before summarizing."));
+                }
+                steps.push(SummaryStep { id: step.id, letter: step.letter.clone(), original: step.content.clone(), content: doc, version: step.version });
+            }
+            if seen_steps.len() != ctx.steps.len() || seen_blocks.len() != blocks.len() {
+                return Err(CoreError::ai("The AI omitted a step or document block. Your A3 was not changed. Please try again."));
+            }
+            steps.sort_by(|a, b| a.letter.cmp(&b.letter));
+            let issues = summary_story_issues(&plan.steps, &ctx, &blocks);
+            let mut repaired = false;
+            if !issues.is_empty() {
+                self.repair_summary_stories(&mut plan.steps, &ctx, &blocks, &issues, tone, &mut log).await?;
+                repaired = true;
+                ensure_summary_stories(&plan.steps, &ctx, &blocks)?;
+            }
+            let mut items = summary_story_items(&plan.steps, &blocks);
+            for (id, rewrite) in &rewrites {
+                let original = &nodes[id];
+                items.push((id.clone(), original.clone(), rewrite.clone()));
+            }
+            let flagged = self.verify_summary(&items, &mut log).await?;
+            let mut story_issues = BTreeMap::new();
+            for id in flagged {
+                log.discard("G6", format!("{id}: proposed claims did not pass verification"));
+                if let Some(letter) = id.strip_prefix("story:").and_then(|id| id.split('.').next()) {
+                    story_issues.insert(letter.to_string(), vec![
+                        "A story claim failed factual verification. Remove unsupported claims and causal links, and preserve the original qualifications, quantities, certainty and action status of every selected claim.".to_string(),
+                    ]);
+                } else if rewrites.remove(&id).is_some() {
+                    retained_details += 1;
+                }
+            }
+            if !story_issues.is_empty() {
+                if repaired {
+                    return Err(CoreError::ai("The corrected story still did not pass factual verification. Your A3 was not changed. Check that the supporting notes clearly distinguish evidence, hypotheses and action status, then regenerate."));
+                }
+                self.repair_summary_stories(&mut plan.steps, &ctx, &blocks, &story_issues, tone, &mut log).await?;
+                ensure_summary_stories(&plan.steps, &ctx, &blocks)?;
+                let corrected: Vec<_> = summary_story_items(&plan.steps, &blocks).into_iter()
+                    .filter(|(id, _, _)| id.strip_prefix("story:").and_then(|id| id.split('.').next()).is_some_and(|letter| story_issues.contains_key(letter)))
+                    .collect();
+                if !self.verify_summary(&corrected, &mut log).await?.is_empty() {
+                    return Err(CoreError::ai("The corrected story still did not pass factual verification. Your A3 was not changed."));
+                }
+            }
+            let rewritten_blocks = summary_rewritten_blocks(&detail_docs, &rewrites)?;
+            for step in &mut steps {
+                let placement = plan.steps.iter().find(|p| p.letter == step.letter).expect("all placements validated");
+                let details: Vec<_> = placement.blocks.iter().map(|id| rewritten_blocks[id].clone()).collect();
+                step.content["content"] = if details.is_empty() { json!([{"type": "paragraph"}]) } else { json!(details) };
+                let story = placement.story.iter().map(|paragraph| {
+                    let sources: Vec<_> = paragraph.sources.iter().map(|id| blocks[id].clone()).collect();
+                    crate::richtext::narrative_paragraph(paragraph.text.trim(), &sources)
+                }).collect();
+                step.content = crate::richtext::story_document(&step.content, story);
+            }
+            let mut notes: Vec<String> = ctx.coverage.clone().into_iter().collect();
+            if repaired || !story_issues.is_empty() {
+                notes.push("The AI automatically corrected the story before it passed the checks.".into());
+            }
+            if retained_details > 0 {
+                notes.push(format!("{retained_details} supporting passage(s) were kept unchanged because their suggested rewrites did not pass factual checks. The verified story is shown above the complete evidence."));
+            }
+            Ok(A3Summary { steps, note: (!notes.is_empty()).then(|| notes.join("\n")), moves, tone })
+        }).await.unwrap_or_else(|_| Err(CoreError::new("AI_TIMEOUT", "The summary exceeded 3 minutes. Your A3 was not changed. Try a faster model or try again.")));
+        if let Err(e) = &result {
+            log.discard("summary", &e.message);
+        }
+        self.finish(Some(sheet), "summarize", Some(&ctx), log, if result.is_ok() { "ok" } else { "failed" }).await;
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, outcome = if result.is_ok() { "ok" } else { "failed" }, "A3 summary finished");
+        result
+    }
+
+    async fn repair_summary_stories(
+        &self,
+        placements: &mut [SummaryPlacement],
+        ctx: &Context,
+        blocks: &BTreeMap<String, Value>,
+        issues: &BTreeMap<String, Vec<String>>,
+        tone: SummaryTone,
+        log: &mut RunLog,
+    ) -> Result<()> {
+        #[derive(Deserialize)]
+        struct Reply {
+            steps: Vec<SummaryStoryEdit>,
+        }
+        let input: Vec<_> = placements.iter().filter(|p| issues.contains_key(&p.letter)).map(|p| {
+            log.discard("summary-repair", format!("{}: {}", p.letter, issues[&p.letter].join("; ")));
+            let evidence: Vec<_> = p.blocks.iter().map(|id| json!({"block": id, "text": crate::richtext::plain_text(&blocks[id])})).collect();
+            json!({
+                "letter": p.letter,
+                "state": ctx.step(&p.letter).map(|s| &s.state),
+                "problems": issues[&p.letter],
+                "previous_story": p.story,
+                "placed_blocks": evidence,
+            })
+        }).collect();
+        let reply: Reply = self.call_json(CompletionRequest {
+            system: format!("{}\n\nRequested tone: {}", prompts::SUMMARY_REPAIR_SYSTEM, tone.instruction()),
+            user: json!(input).to_string(),
+            schema: Some(prompts::summary_repair_schema()),
+            max_tokens: 4_096,
+            fast: true,
+            ..Default::default()
+        }, log).await?;
+        let mut seen = HashSet::new();
+        if reply.steps.len() != issues.len() || reply.steps.iter().any(|s| !issues.contains_key(&s.letter) || !seen.insert(s.letter.clone())) {
+            return Err(CoreError::ai("The AI correction omitted, repeated or changed a section. Your A3 was not changed."));
+        }
+        for edit in reply.steps {
+            placements.iter_mut().find(|p| p.letter == edit.letter).expect("correction letters validated").story = edit.story;
+        }
+        Ok(())
+    }
+
+    async fn verify_summary_batch(&self, items: &[(String, String, String)], log: &mut RunLog) -> Result<HashSet<String>> {
+        if items.is_empty() {
+            return Ok(HashSet::new());
+        }
+        #[derive(Deserialize)]
+        struct Verdict {
+            rejected_ids: Vec<String>,
+        }
+        let input: Vec<_> = items.iter().map(|(id, original, rewrite)| json!({"id": id, "original": original, "rewrite": rewrite})).collect();
+        let verdict: Verdict = self.call_json(
+            CompletionRequest {
+                system: prompts::SUMMARY_VERIFY_SYSTEM.into(),
+                user: json!(input).to_string(),
+                schema: Some(prompts::summary_verify_schema()),
+                max_tokens: 4_096,
+                fast: true,
+                ..Default::default()
+            }, log,
+        ).await.map_err(|e| CoreError::new(e.code, format!("Summary fact-check failed: {}", e.message)))?;
+        if verdict.rejected_ids.iter().any(|id| !items.iter().any(|(known, _, _)| known == id)) {
+            return Err(CoreError::ai("The summary fact-check returned an unknown item. Your A3 was not changed."));
+        }
+        Ok(verdict.rejected_ids.into_iter().collect())
+    }
+
+    async fn verify_summary(&self, items: &[(String, String, String)], log: &mut RunLog) -> Result<HashSet<String>> {
+        let batches = summary_batches(items);
+        let mut flagged = HashSet::new();
+        for pair in batches.chunks(2) {
+            let mut left_log = RunLog::default();
+            let mut right_log = RunLog::default();
+            let (left, right) = tokio::join!(
+                self.verify_summary_batch(pair[0], &mut left_log),
+                self.verify_summary_batch(pair.get(1).copied().unwrap_or(&[]), &mut right_log),
+            );
+            log.absorb(left_log);
+            log.absorb(right_log);
+            flagged.extend(left?);
+            flagged.extend(right?);
+        }
+        Ok(flagged)
+    }
+
     // ---------------------------------------------------------------- early warning draft
 
     pub async fn draft_warning(&self, sheet: Uuid) -> Result<WarningDraft> {
@@ -887,6 +1221,7 @@ impl AiService {
                     images,
                     schema: Some(prompts::vision_schema()),
                     max_tokens: MAX_TOKENS,
+                    fast: false,
                 },
                 &mut log,
             )
@@ -933,6 +1268,7 @@ pub async fn test_connection(provider: &dyn AiProvider) -> ConnectionTest {
         images: vec![test_image()],
         schema: Some(schema),
         max_tokens: 2000,
+        fast: false,
     };
     match provider.complete(&vreq).await {
         Ok(c) => {
@@ -1006,6 +1342,89 @@ fn strip_passages(text: &str) -> String {
     }
 }
 
+fn summary_story_issues(placements: &[SummaryPlacement], ctx: &Context, blocks: &BTreeMap<String, Value>) -> BTreeMap<String, Vec<String>> {
+    let mut issues = BTreeMap::new();
+    for p in placements {
+        let mut problems = Vec::new();
+        let has_text = p.blocks.iter().any(|id| !crate::richtext::plain_text(&blocks[id]).trim().is_empty());
+        let closed = ctx.step(&p.letter).is_some_and(|s| s.state == "closed");
+        if !has_text || closed {
+            if !p.story.is_empty() {
+                problems.push("Empty or closed sections must have an empty story array.".into());
+            }
+        } else if p.story.is_empty() {
+            problems.push("Write a concise story, not just rearranged details.".into());
+        }
+        for (i, paragraph) in p.story.iter().enumerate() {
+            if paragraph.text.trim().is_empty() || paragraph.sources.is_empty() {
+                problems.push(format!("Paragraph {} is empty or has no cited block ids.", i + 1));
+                continue;
+            }
+            let mut seen = HashSet::new();
+            if paragraph.sources.iter().any(|id| !p.blocks.contains(id) || !seen.insert(id)) {
+                problems.push(format!("Paragraph {} must cite unique block ids placed in this section only.", i + 1));
+                continue;
+            }
+            let input = paragraph.sources.iter().map(|id| crate::richtext::plain_text(&blocks[id])).collect::<Vec<_>>().join("\n");
+            let added = guard::unsupported_story_tokens(paragraph.text.trim(), &input);
+            if !added.is_empty() {
+                problems.push(format!("Paragraph {} contains unsupported numbers, names, codes or units: {}. Remove them or cite the placed block that actually supports them. Equivalent quantity notation is allowed, but do not change the value, approximation, unit or identifier.", i + 1, added.join(", ")));
+            }
+        }
+        if !problems.is_empty() {
+            issues.insert(p.letter.clone(), problems);
+        }
+    }
+    issues
+}
+
+fn ensure_summary_stories(placements: &[SummaryPlacement], ctx: &Context, blocks: &BTreeMap<String, Value>) -> Result<()> {
+    if let Some((letter, problems)) = summary_story_issues(placements, ctx, blocks).into_iter().next() {
+        return Err(CoreError::ai(format!("The AI could not correct the story for step {letter}: {} Your A3 was not changed.", problems.join(" "))));
+    }
+    Ok(())
+}
+
+fn summary_story_items(placements: &[SummaryPlacement], blocks: &BTreeMap<String, Value>) -> Vec<(String, String, String)> {
+    placements.iter().flat_map(|p| p.story.iter().enumerate().map(|(i, paragraph)| {
+        let input = paragraph.sources.iter().map(|id| crate::richtext::plain_text(&blocks[id])).collect::<Vec<_>>().join("\n");
+        (format!("story:{}.{i}", p.letter), input, paragraph.text.trim().to_string())
+    })).collect()
+}
+
+fn summary_rewritten_blocks(details: &BTreeMap<String, Value>, rewrites: &BTreeMap<String, String>) -> Result<BTreeMap<String, Value>> {
+    let mut blocks = BTreeMap::new();
+    for (letter, doc) in details {
+        let prefix = format!("{letter}.");
+        let edits = rewrites.iter().filter_map(|(id, text)| id.strip_prefix(&prefix).map(|id| (id.to_string(), text.clone()))).collect();
+        let order: Vec<_> = (0..doc["content"].as_array().map_or(0, Vec::len)).collect();
+        let rewritten = crate::richtext::rewrite_blocks(doc, &order, &edits).map_err(|e| CoreError::ai(&e))?;
+        for (i, block) in rewritten["content"].as_array().into_iter().flatten().enumerate() {
+            blocks.insert(format!("{letter}.{i}"), block.clone());
+        }
+    }
+    Ok(blocks)
+}
+
+fn summary_batches(items: &[(String, String, String)]) -> Vec<&[(String, String, String)]> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    let mut size = 0;
+    for (i, (id, original, rewrite)) in items.iter().enumerate() {
+        let bytes = id.len() + original.len() + rewrite.len();
+        if i > start && (i - start >= 8 || size + bytes > 12_000) {
+            batches.push(&items[start..i]);
+            start = i;
+            size = 0;
+        }
+        size += bytes;
+    }
+    if start < items.len() {
+        batches.push(&items[start..]);
+    }
+    batches
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1036,5 +1455,16 @@ mod tests {
         let t = "<sheet_state>x</sheet_state>\n<source_passages>secret cause</source_passages>\nend";
         assert!(!strip_passages(t).contains("secret"));
         assert!(strip_passages(t).contains("<sheet_state>"));
+    }
+
+    #[test]
+    fn verification_batches_limit_count_and_size_without_dropping_large_nodes() {
+        let items: Vec<_> = (0..20).map(|i| (i.to_string(), "a".repeat(3000), "b".repeat(3000))).collect();
+        let batches = summary_batches(&items);
+        assert_eq!(batches.iter().map(|b| b.len()).sum::<usize>(), items.len());
+        assert!(batches.iter().all(|batch| batch.len() <= 8 && batch.iter().map(|(id, a, b)| id.len() + a.len() + b.len()).sum::<usize>() <= 12_000));
+        let large = vec![("large".into(), "x".repeat(14_000), "y".repeat(14_000))];
+        assert_eq!(summary_batches(&large)[0], large.as_slice(), "one long node stays intact");
+        assert!(summary_batches(&[]).is_empty());
     }
 }

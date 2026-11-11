@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Box, Button, Card, Chip, CircularProgress, Dialog, DialogActions, DialogContent, DialogTitle, IconButton, Stack, ToggleButton, ToggleButtonGroup, Tooltip, Typography } from '@mui/material';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Alert, Box, Button, Card, Chip, CircularProgress, Dialog, DialogActions, DialogContent, DialogTitle, IconButton, MenuItem, Stack, TextField, ToggleButton, ToggleButtonGroup, Tooltip, Typography } from '@mui/material';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { call, errorMessage, LETTERS, STEP_NAMES, type AiSettingsView, type Letter, type Sheet, type Step, type Suggestion } from '../../api';
+import { call, errorMessage, LETTERS, STEP_NAMES, SUMMARY_TONES, type A3Summary, type AiSettingsView, type Letter, type Sheet, type Step, type Suggestion, type SummaryTone } from '../../api';
 import { useApp } from '../../context';
 import { measureFit, type FitResult } from '../../lib/fit';
 import { formatDate, wordDiff } from '../../lib/text';
+import { plainText, sameDocument, storyParts, type DocNode } from '../../lib/doc';
 import { tokens } from '../../theme';
 import { Icon } from '../common';
 import { StepEditor, type StepEditorHandle } from '../editor/StepEditor';
@@ -38,10 +39,28 @@ export function SheetTab({ sheet, steps, openConflicts, onOpenSource }: Props) {
   const [fit, setFit] = useState<Partial<Record<Letter, FitResult>>>({});
   const [suggestions, setSuggestions] = useState<Partial<Record<Letter, Suggestion[]>>>({});
   const [improving, setImproving] = useState<Letter | null>(null);
+  const [summarizing, setSummarizing] = useState(false);
+  const [summary, setSummary] = useState<A3Summary | null>(null);
+  const [applyingSummary, setApplyingSummary] = useState(false);
+  const [tone, setTone] = useState<SummaryTone>('plain');
+  const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [summarySeconds, setSummarySeconds] = useState(0);
+  const [summaryView, setSummaryView] = useState<'readable' | 'diff'>('readable');
   const { notify } = useApp();
   const qc = useQueryClient();
   const ai = useQuery({ queryKey: ['ai-settings'], queryFn: () => call<AiSettingsView>('ai_settings_get') });
   const aiReady = !!ai.data?.ready && sheet.projectAiEnabled;
+  const summaryDiffs = useMemo(() => new Map(
+    summary?.steps.filter((s) => !sameDocument(s.original, s.content))
+      .map((s) => [s.letter, wordDiff(plainText(s.original), plainText(s.content))]) ?? [],
+  ), [summary]);
+
+  useEffect(() => {
+    if (!summarizing) return;
+    const started = Date.now();
+    const timer = window.setInterval(() => setSummarySeconds(Math.floor((Date.now() - started) / 1000)), 1000);
+    return () => window.clearInterval(timer);
+  }, [summarizing]);
 
   useEffect(() => {
     try {
@@ -97,6 +116,7 @@ export function SheetTab({ sheet, steps, openConflicts, onOpenSource }: Props) {
     setImproving(letter);
     setSuggestions((s) => ({ ...s, [letter]: undefined }));
     try {
+      await editors.current[letter]?.flush();
       const got = await call<Suggestion[]>('ai_improve', { sheet: sheet.id, letter, selection });
       setSuggestions((s) => ({ ...s, [letter]: got }));
       if (got.length === 0) notify({ severity: 'info', message: `Step ${letter} already reads clearly.` });
@@ -104,6 +124,53 @@ export function SheetTab({ sheet, steps, openConflicts, onOpenSource }: Props) {
       notify({ severity: 'error', message: errorMessage(e) });
     } finally {
       setImproving(null);
+    }
+  };
+
+  const summarize = async () => {
+    if (summarizing || applyingSummary) return;
+    if (!aiReady) {
+      notify({ severity: 'info', message: sheet.projectAiEnabled ? 'Set up AI in Settings' : 'AI is turned off for this project.' });
+      return;
+    }
+    setSummarizing(true);
+    setSummarySeconds(0);
+    setSummaryError(null);
+    try {
+      await Promise.all(LETTERS.map((letter) => editors.current[letter]?.flush()));
+      const draft = await call<A3Summary>('ai_summarize', { sheet: sheet.id, tone });
+      if (draft.steps.every((s) => sameDocument(s.original, s.content))) {
+        notify({ severity: 'info', message: 'No summary or section moves were proposed for this A3.' });
+      }
+      setSummary(draft);
+    } catch (e) {
+      const message = errorMessage(e);
+      setSummaryError(message);
+      notify({ severity: 'error', message });
+    } finally {
+      setSummarizing(false);
+    }
+  };
+
+  const acceptSummary = async () => {
+    if (!summary || summarizing || tone !== summary.tone) return;
+    setApplyingSummary(true);
+    try {
+      await Promise.all(LETTERS.map((letter) => editors.current[letter]?.flush()));
+      if (!summary.steps.every((s) => editors.current[s.letter]?.matchesSummary(s.original, s.version))) {
+        notify({ severity: 'warning', message: 'This A3 has changed. Dismiss this draft and generate a new summary to avoid overwriting edits.' });
+        return;
+      }
+      const saved = await call<Step[]>('ai_apply_summary', { sheet: sheet.id, draft: summary });
+      saved.forEach((s) => editors.current[s.letter]?.loadSavedStep(s));
+      setSuggestions({});
+      setSummary(null);
+      refresh();
+      notify({ severity: 'success', message: 'Summary and section moves applied.' });
+    } catch (e) {
+      notify({ severity: 'error', message: errorMessage(e) });
+    } finally {
+      setApplyingSummary(false);
     }
   };
 
@@ -185,6 +252,8 @@ export function SheetTab({ sheet, steps, openConflicts, onOpenSource }: Props) {
             canEdit={sheet.canEdit && !sheet.withdrawnAt}
             onOpenSource={(id) => onOpenSource(id)}
             onImprove={(sel) => void improve(letter, sel)}
+            aiBusy={improving !== null || summarizing || applyingSummary}
+            applyingSummary={applyingSummary}
             onHtmlChange={(html) => onHtml(letter, html)}
             fill
           />
@@ -201,6 +270,20 @@ export function SheetTab({ sheet, steps, openConflicts, onOpenSource }: Props) {
             <ToggleButton value="quadrant" sx={{ textTransform: 'none', px: 1.5, py: 0.25 }}><Icon name="grid_view" size={18} />&nbsp;Quadrant</ToggleButton>
             <ToggleButton value="accordion" sx={{ textTransform: 'none', px: 1.5, py: 0.25 }}><Icon name="view_agenda" size={18} />&nbsp;Accordion</ToggleButton>
           </ToggleButtonGroup>
+          {sheet.canEdit && !sheet.withdrawnAt && (
+            <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>
+            <SummaryTonePicker id="summary-tone" tone={tone} onChange={setTone} disabled={summarizing || applyingSummary} />
+            <Button
+              size="small"
+              variant="outlined"
+              startIcon={summarizing ? <CircularProgress size={14} /> : <Icon name="auto_awesome" size={16} />}
+              disabled={summarizing || improving !== null || applyingSummary}
+              onClick={() => void summarize()}
+            >
+              {summarizing ? `Reviewing full A3... ${summarySeconds}s` : 'Review & summarize A3'}
+            </Button>
+            </Stack>
+          )}
           {!sheet.canEdit && <Typography variant="body2" color="text.secondary">You can read this A3. Only project members can edit it.</Typography>}
         </Stack>
         {view === 'quadrant' ? (
@@ -221,6 +304,64 @@ export function SheetTab({ sheet, steps, openConflicts, onOpenSource }: Props) {
           </Tooltip>
         </Stack>
       )}
+
+      <Dialog open={!!summary} onClose={() => !applyingSummary && !summarizing && setSummary(null)} maxWidth="lg" fullWidth aria-labelledby="summary-title">
+        <DialogTitle id="summary-title">Review proposed A3 changes</DialogTitle>
+        <DialogContent>
+          <Stack direction="row" spacing={2} sx={{ mb: 2, mt: 1, alignItems: 'center', flexWrap: 'wrap', gap: 1 }}>
+            <SummaryTonePicker id="preview-summary-tone" tone={tone} onChange={setTone} disabled={summarizing || applyingSummary} />
+            <Button variant="outlined" disabled={summarizing || applyingSummary} onClick={() => void summarize()}>
+              {summarizing ? `Regenerating... ${summarySeconds}s` : 'Regenerate with this tone'}
+            </Button>
+            <Typography variant="caption" color="text.secondary">
+              Preview tone: {SUMMARY_TONES.find((t) => t.value === summary?.tone)?.label}
+            </Typography>
+          </Stack>
+          <ToggleButtonGroup size="small" exclusive value={summaryView} onChange={(_, value) => value && setSummaryView(value)} aria-label="Proposal preview mode" sx={{ mb: 2 }}>
+            <ToggleButton value="readable">Readable draft</ToggleButton>
+            <ToggleButton value="diff">Highlighted changes</ToggleButton>
+          </ToggleButtonGroup>
+          {summarizing && <Alert severity="info" sx={{ mb: 2 }}>Generating and fact-checking a new draft. The previous preview remains below; applying is disabled until this finishes.</Alert>}
+          {summaryError && <Alert severity="error" sx={{ mb: 2 }}>{summaryError} The previous preview has not been replaced.</Alert>}
+          {summary && summary.tone !== tone && !summarizing && (
+            <Alert severity="warning" sx={{ mb: 2 }}>The selected tone differs from this preview. Regenerate to review it before applying.</Alert>
+          )}
+          <Alert severity="info" sx={{ mb: 2 }}>Read the story first; expand the supporting details when needed. Use Highlighted changes to inspect the exact changes. Nothing changes until you apply all changes. Closed sections remain unchanged.</Alert>
+          {summary?.note && <Alert severity="warning" sx={{ mb: 2, whiteSpace: 'pre-line' }}>Review notes: {summary.note}</Alert>}
+          {summary?.moves.map((move, i) => (
+            <Typography key={i} variant="body2" sx={{ mb: 1 }}>Move {move.from} to {move.to}: {move.text}</Typography>
+          ))}
+          {summary?.steps.map((s) => (
+            <Box key={s.letter} sx={{ mb: 3 }}>
+              <Typography variant="h4" sx={{ mb: 1 }}>{s.letter}. {STEP_NAMES[s.letter]}</Typography>
+              {sameDocument(s.original, s.content) ? <Typography variant="body2" color="text.secondary">No changes.</Typography> : (
+                <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr' }, gap: 2 }}>
+                  <Box>
+                    <Typography variant="subtitle2">Current</Typography>
+                    {summaryView === 'readable' ? <StoryPreview doc={s.original} onOpenSource={onOpenSource} /> : (
+                      <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>{plainText(s.original) || '(empty)'}</Typography>
+                    )}
+                  </Box>
+                  <Box>
+                    <Typography variant="subtitle2">{summaryView === 'readable' ? 'Proposed' : 'Proposed (changes highlighted)'}</Typography>
+                    {summaryView === 'readable' ? <StoryPreview doc={s.content} onOpenSource={onOpenSource} /> : (
+                      <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
+                        {summaryDiffs.get(s.letter)?.map((p, i) => (
+                          <span key={i} className={p.kind === 'del' ? 'diff-del' : p.kind === 'add' ? 'diff-add' : undefined}>{p.text}</span>
+                        ))}
+                      </Typography>
+                    )}
+                  </Box>
+                </Box>
+              )}
+            </Box>
+          ))}
+        </DialogContent>
+        <DialogActions>
+          <Button disabled={applyingSummary || summarizing} onClick={() => setSummary(null)}>Dismiss</Button>
+          <Button disabled={applyingSummary || summarizing || tone !== summary?.tone} variant="contained" onClick={() => void acceptSummary()}>{applyingSummary ? 'Applying...' : 'Apply all changes'}</Button>
+        </DialogActions>
+      </Dialog>
 
       <Dialog open={!!closing} onClose={() => setClosing(null)} maxWidth="xs" fullWidth>
         <DialogTitle>Close step {closing?.letter}?</DialogTitle>
@@ -245,6 +386,60 @@ export function SheetTab({ sheet, steps, openConflicts, onOpenSource }: Props) {
         <DialogActions><Button onClick={() => setReopening(null)}>Cancel</Button></DialogActions>
       </Dialog>
     </Box>
+  );
+}
+
+function StoryPreview({ doc, onOpenSource }: { doc: DocNode; onOpenSource: (segmentId: string) => void }) {
+  const { story, details } = storyParts(doc);
+  if (story.length === 0) return <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>{plainText(doc) || '(empty)'}</Typography>;
+  return (
+    <Box>
+      <Typography variant="overline" color="primary">At a glance</Typography>
+      {story.map((paragraph, i) => {
+        const refs = new Map<string, string>();
+        const collect = (node: DocNode) => {
+          for (const mark of node.marks ?? []) {
+            if (mark.type === 'source' && typeof mark.attrs?.segmentId === 'string') {
+              refs.set(mark.attrs.segmentId, typeof mark.attrs.label === 'string' ? mark.attrs.label : 'Source');
+            }
+          }
+          node.content?.forEach(collect);
+        };
+        collect(paragraph);
+        return (
+          <Box key={i} sx={{ mb: 1.5 }}>
+            <Typography variant="body2" sx={{ lineHeight: 1.7 }}>{plainText(paragraph)}</Typography>
+            <Stack direction="row" spacing={0.5} useFlexGap sx={{ flexWrap: 'wrap' }}>
+              {[...refs].map(([id, label]) => <Button key={id} size="small" onClick={() => onOpenSource(id)} sx={{ fontSize: 11, py: 0 }}>{label}</Button>)}
+            </Stack>
+          </Box>
+        );
+      })}
+      <Box component="details" sx={{ mt: 1 }}>
+        <Box component="summary" sx={{ cursor: 'pointer', color: tokens.textSecondary, typography: 'caption' }}>Supporting evidence and details</Box>
+        <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', mt: 1 }}>{plainText({ type: 'doc', content: details })}</Typography>
+      </Box>
+    </Box>
+  );
+}
+
+function SummaryTonePicker({ id, tone, onChange, disabled }: { id: string; tone: SummaryTone; onChange: (tone: SummaryTone) => void; disabled: boolean }) {
+  return (
+    <TextField
+      select
+      id={id}
+      label="Writing tone"
+      size="small"
+      value={tone}
+      disabled={disabled}
+      onChange={(event) => {
+        const selected = SUMMARY_TONES.find((t) => t.value === event.target.value);
+        if (selected) onChange(selected.value);
+      }}
+      sx={{ minWidth: 180 }}
+    >
+      {SUMMARY_TONES.map((t) => <MenuItem key={t.value} value={t.value}>{t.label}</MenuItem>)}
+    </TextField>
   );
 }
 
@@ -285,4 +480,3 @@ function SuggestionRow({ suggestion, onAccept, onDismiss }: { suggestion: Sugges
     </Box>
   );
 }
-

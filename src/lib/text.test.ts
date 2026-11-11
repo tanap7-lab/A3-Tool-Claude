@@ -16,6 +16,16 @@ describe('wordDiff', () => {
     expect(d.filter((p) => p.kind !== 'add').map((p) => p.text).join('')).toBe(before);
     expect(d.filter((p) => p.kind !== 'del').map((p) => p.text).join('')).toBe(after);
   });
+
+  it('handles large section rewrites without a quadratic matrix and preserves both versions', () => {
+    const before = `Header\n${'old text '.repeat(10_000)}\nEnd`;
+    const after = `Header\n${'new wording '.repeat(10_000)}\nEnd`;
+    const d = wordDiff(before, after);
+    expect(d.length).toBeLessThanOrEqual(4);
+    expect(d.filter((p) => p.kind !== 'add').map((p) => p.text).join('')).toBe(before);
+    expect(d.filter((p) => p.kind !== 'del').map((p) => p.text).join('')).toBe(after);
+    expect(wordDiff(before, before)).toEqual([{ kind: 'same', text: before }]);
+  });
 });
 
 describe('findQuote', () => {

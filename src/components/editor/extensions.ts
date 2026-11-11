@@ -1,4 +1,4 @@
-import { Mark, mergeAttributes } from '@tiptap/core';
+import { Mark, Node, mergeAttributes } from '@tiptap/core';
 import Image from '@tiptap/extension-image';
 import { Table } from '@tiptap/extension-table';
 import { TableCell } from '@tiptap/extension-table-cell';
@@ -7,6 +7,7 @@ import { TableRow } from '@tiptap/extension-table-row';
 import Placeholder from '@tiptap/extension-placeholder';
 import StarterKit from '@tiptap/starter-kit';
 import { Plugin } from '@tiptap/pm/state';
+import { DOMSerializer, type DOMOutputSpec } from '@tiptap/pm/model';
 import { isEdited } from '../../lib/doc';
 
 /** FR-A3-05 and 06: marks text that came from a file. Editing it keeps the chip, marked "edited". */
@@ -90,6 +91,57 @@ const LocalImage = Image.extend({
   },
 }).configure({ allowBase64: true });
 
+const Narrative = Node.create({
+  name: 'a3Narrative',
+  group: 'block',
+  content: 'paragraph+',
+  defining: true,
+  addAttributes() {
+    return { baseline: { default: '', rendered: false } };
+  },
+  parseHTML() {
+    return [{
+      tag: 'section[data-a3-narrative]',
+      contentElement: '[data-a3-content]',
+      getAttrs: (element) => ({ baseline: element.getAttribute('data-baseline') ?? '' }),
+    }];
+  },
+  renderHTML({ node }) {
+    return ['section', { 'data-a3-narrative': '', 'data-baseline': node.attrs.baseline },
+      ['p', { contenteditable: 'false' }, ['strong', {}, 'At a glance']],
+      ['div', { 'data-a3-content': '' }, 0]];
+  },
+});
+
+const evidenceSpec: DOMOutputSpec = ['details', { 'data-a3-evidence': '' },
+  ['summary', { contenteditable: 'false' }, 'Supporting evidence and details'],
+  ['div', { 'data-a3-content': '' }, 0]];
+
+const Evidence = Node.create({
+  name: 'a3Evidence',
+  group: 'block',
+  content: 'block+',
+  defining: true,
+  parseHTML() {
+    return [{ tag: 'details[data-a3-evidence]', contentElement: '[data-a3-content]' }];
+  },
+  renderHTML() {
+    return evidenceSpec;
+  },
+  addNodeView() {
+    return () => {
+      const { dom, contentDOM } = DOMSerializer.renderSpec(document, evidenceSpec);
+      return {
+        dom,
+        contentDOM,
+        stopEvent: (event) => event.target instanceof Element && event.target.closest('summary')?.parentNode === dom,
+        // Disclosure state is view-only; reparsing this attribute would close it again.
+        ignoreMutation: (mutation) => mutation.type === 'attributes' && mutation.target === dom,
+      };
+    };
+  },
+});
+
 /** FR-A3-02: bold, italic, bullets, numbering, simple tables and pasted images. Nothing else. */
 export function stepExtensions(placeholder: string) {
   return [
@@ -102,8 +154,11 @@ export function stepExtensions(placeholder: string) {
       strike: false,
       underline: false,
       link: false,
+      trailingNode: { notAfter: ['a3Narrative', 'a3Evidence'] },
     }),
     SourceMark,
+    Narrative,
+    Evidence,
     LocalImage,
     Table.configure({ resizable: false }),
     TableRow,

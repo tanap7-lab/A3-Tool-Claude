@@ -22,6 +22,8 @@ pub struct ContextOptions {
     /// Leave step B text out. Used while B is open, so a warning draft has no cause to state.
     pub hide_open_cause: bool,
     pub ask_history: bool,
+    /// Summary requests already carry all step text in their document outline.
+    pub omit_step_text: bool,
 }
 
 pub struct Citation {
@@ -138,7 +140,9 @@ pub async fn build(repo: &dyn Repository, sheet_id: Uuid, opts: &ContextOptions)
         }
         for (i, s) in parts.into_iter().enumerate() {
             let id = format!("{l}.{}", i + 1);
-            let _ = writeln!(t, "  [{id}] {}", fence(&s));
+            if !opts.omit_step_text {
+                let _ = writeln!(t, "  [{id}] {}", fence(&s));
+            }
             sentences.insert(id, s);
         }
     }

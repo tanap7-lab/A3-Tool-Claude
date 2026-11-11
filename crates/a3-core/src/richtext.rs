@@ -5,6 +5,113 @@ use crate::domain::normalize;
 use html_escape::{encode_double_quoted_attribute as attr, encode_text as esc};
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
+
+/// Stable paths let the AI rewrite text without generating editor JSON or source marks.
+pub fn text_nodes(doc: &Value) -> BTreeMap<String, String> {
+    fn walk(node: &Value, path: &str, out: &mut BTreeMap<String, String>) {
+        if node["type"] == "text" {
+            if let Some(text) = node["text"].as_str() {
+                out.insert(path.to_string(), text.to_string());
+            }
+        }
+        for (i, child) in children(node).iter().enumerate() {
+            let id = if path.is_empty() { i.to_string() } else { format!("{path}.{i}") };
+            walk(child, &id, out);
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(doc, "", &mut out);
+    out
+}
+
+pub fn rewrite_blocks(doc: &Value, order: &[usize], rewrites: &BTreeMap<String, String>) -> std::result::Result<Value, String> {
+    let blocks = doc["content"].as_array().ok_or("The step has no document blocks.")?;
+    let mut sorted = order.to_vec();
+    sorted.sort_unstable();
+    if sorted != (0..blocks.len()).collect::<Vec<_>>() {
+        return Err("The AI omitted or repeated a document block.".into());
+    }
+    let nodes = text_nodes(doc);
+    if rewrites.iter().any(|(id, text)| !nodes.contains_key(id) || text.trim().is_empty()) {
+        return Err("The AI returned an unknown or empty text node.".into());
+    }
+    fn walk(node: &mut Value, path: &str, rewrites: &BTreeMap<String, String>) {
+        if let Some(text) = rewrites.get(path) {
+            if node["text"].as_str() != Some(text) {
+                node["text"] = json!(text);
+                if let Some(marks) = node.get_mut("marks").and_then(Value::as_array_mut) {
+                    for mark in marks.iter_mut().filter(|m| m["type"] == "source") {
+                        mark["attrs"]["edited"] = json!(true);
+                    }
+                }
+            }
+        }
+        if let Some(content) = node.get_mut("content").and_then(Value::as_array_mut) {
+            for (i, child) in content.iter_mut().enumerate() {
+                let id = if path.is_empty() { i.to_string() } else { format!("{path}.{i}") };
+                walk(child, &id, rewrites);
+            }
+        }
+    }
+    let mut out = doc.clone();
+    walk(&mut out, "", rewrites);
+    let rewritten = out["content"].as_array().ok_or("The step has no document blocks.")?;
+    let reordered: Vec<Value> = order.iter().map(|&i| rewritten[i].clone()).collect();
+    out["content"] = json!(reordered);
+    Ok(out)
+}
+
+/// Generated leads can be replaced; human edits to a lead become supporting details.
+pub fn summary_evidence(doc: &Value) -> Value {
+    let mut blocks = Vec::new();
+    for block in children(doc) {
+        match block["type"].as_str() {
+            Some("a3Evidence") => blocks.extend(children(block).iter().cloned()),
+            Some("a3Narrative") => {
+                if block["attrs"]["baseline"].as_str() != Some(plain_text(block).as_str()) {
+                    blocks.extend(children(block).iter().cloned());
+                }
+            }
+            _ => blocks.push(block.clone()),
+        }
+    }
+    let mut out = doc.clone();
+    out["content"] = if blocks.is_empty() { empty_doc()["content"].clone() } else { json!(blocks) };
+    out
+}
+
+pub fn narrative_paragraph(text: &str, sources: &[Value]) -> Value {
+    let mut refs = Vec::new();
+    for source in sources {
+        for r in source_refs(source) {
+            if !refs.iter().any(|known: &SourceRef| known.segment_id == r.segment_id) {
+                refs.push(r);
+            }
+        }
+    }
+    let marks: Vec<_> = refs.iter().filter_map(|r| {
+        let mut mark = source_mark(Some(&r.segment_id), Some(&r.label), text, false)?;
+        mark["attrs"]["edited"] = json!(true);
+        Some(mark)
+    }).collect();
+    let mut node = json!({"type": "text", "text": text});
+    if !marks.is_empty() {
+        node["marks"] = json!(marks);
+    }
+    json!({"type": "paragraph", "content": [node]})
+}
+
+pub fn story_document(details: &Value, story: Vec<Value>) -> Value {
+    if story.is_empty() {
+        return details.clone();
+    }
+    let mut lead = json!({"type": "a3Narrative", "attrs": {}, "content": story});
+    lead["attrs"]["baseline"] = json!(plain_text(&lead));
+    let mut out = details.clone();
+    out["content"] = json!([lead, {"type": "a3Evidence", "content": children(details)}]);
+    out
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +133,10 @@ pub fn plain_text(doc: &Value) -> String {
 
 fn write_plain(node: &Value, out: &mut String) {
     match node.get("type").and_then(Value::as_str).unwrap_or("") {
+        "a3Narrative" | "a3Evidence" => {
+            out.push_str(if node["type"] == "a3Narrative" { "At a glance\n" } else { "Supporting evidence and details\n" });
+            children(node).iter().for_each(|c| write_plain(c, out));
+        }
         "text" => out.push_str(node.get("text").and_then(Value::as_str).unwrap_or("")),
         "hardBreak" => out.push('\n'),
         "paragraph" | "heading" => {
@@ -152,6 +263,21 @@ pub fn source_refs(doc: &Value) -> Vec<SourceRef> {
     out
 }
 
+pub fn source_originals(doc: &Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(marks) = doc["marks"].as_array() {
+        for mark in marks.iter().filter(|m| m["type"] == "source") {
+            if let (Some(id), Some(text)) = (mark["attrs"]["segmentId"].as_str(), mark["attrs"]["original"].as_str()) {
+                out.push((id.to_string(), text.to_string()));
+            }
+        }
+    }
+    for child in children(doc) {
+        out.extend(source_originals(child));
+    }
+    out
+}
+
 fn collect_refs(node: &Value, out: &mut Vec<SourceRef>) {
     if let Some(marks) = node.get("marks").and_then(Value::as_array) {
         for m in marks {
@@ -200,6 +326,11 @@ fn wrap(node: &Value, tag: &str, out: &mut String) {
 
 fn write_html(node: &Value, out: &mut String) {
     match node.get("type").and_then(Value::as_str).unwrap_or("") {
+        "a3Narrative" | "a3Evidence" => {
+            out.push_str(if node["type"] == "a3Narrative" { "<section><p><strong>At a glance</strong></p>" } else { "<section><p><strong>Supporting evidence and details</strong></p>" });
+            write_children(node, out);
+            out.push_str("</section>");
+        }
         "doc" => write_children(node, out),
         "paragraph" => {
             if children(node).is_empty() {
@@ -286,5 +417,41 @@ mod tests {
         assert!(html.contains("<strong>&lt;script&gt;"));
         assert!(!html.contains("evil.example"));
         assert!(html.contains("data:image/png;base64,AAAA"));
+    }
+
+    #[test]
+    fn story_keeps_all_evidence_sources_and_exports() {
+        let details = json!({"type": "doc", "content": [
+            sourced_paragraph("Sensor failed intermittently.", Some("s1"), Some("Page 1"), false),
+            sourced_paragraph("There were 39 returns.", Some("s2"), Some("Page 2"), true),
+            {"type": "image", "attrs": {"src": "data:image/png;base64,AAAA"}}
+        ]});
+        let lead = narrative_paragraph("The sensor failed intermittently, with 39 returns.", children(&details));
+        let doc = story_document(&details, vec![lead]);
+        assert_eq!(doc["content"][1]["content"], details["content"]);
+        assert_eq!(summary_evidence(&doc), details, "an unchanged lead is replaced, not recursively summarized");
+        assert_eq!(source_refs(&doc).len(), 2);
+        let marks = doc["content"][0]["content"][0]["content"][0]["marks"].as_array().unwrap();
+        assert_eq!(marks.len(), 2);
+        assert!(marks.iter().all(|m| m["attrs"]["edited"] == true));
+        assert!(marks.iter().all(|m| m["attrs"]["original"] == "The sensor failed intermittently, with 39 returns."));
+        let html = to_html(&doc);
+        assert!(html.contains("At a glance") && html.contains("Supporting evidence and details"));
+        assert!(html.contains("Sensor failed intermittently.") && html.contains("There were 39 returns."));
+        assert!(html.contains("<img") && !html.contains("<details"), "exports include all evidence without a collapsed disclosure");
+        assert!(plain_text(&doc).contains("Supporting evidence and details\nSensor failed intermittently."));
+    }
+
+    #[test]
+    fn manually_edited_leads_become_evidence_without_nesting() {
+        let details = json!({"type": "doc", "content": [sourced_paragraph("The sensor failed.", None, None, false)]});
+        let mut doc = story_document(&details, vec![narrative_paragraph("The sensor failed.", &[])]);
+        doc["content"][0]["content"][0]["content"][0]["text"] = json!("The sensor failed. Validation is pending.");
+        let evidence = summary_evidence(&doc);
+        assert_eq!(plain_text(&evidence), "The sensor failed. Validation is pending.\nThe sensor failed.");
+        assert!(children(&evidence).iter().all(|b| b["type"] == "paragraph"));
+        let revised = story_document(&evidence, vec![narrative_paragraph("Validation is pending.", &[])]);
+        assert_eq!(summary_evidence(&revised), evidence);
+        assert_eq!(story_document(&empty_doc(), Vec::new()), empty_doc());
     }
 }

@@ -151,6 +151,8 @@ pub fn run() {
             commands::messages_list,
             commands::ai_review,
             commands::ai_improve,
+            commands::ai_summarize,
+            commands::ai_apply_summary,
             commands::ai_condense,
             commands::ai_draft_warning,
             commands::ai_ask,

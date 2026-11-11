@@ -2,7 +2,7 @@
 
 use crate::jobs::spawn_attachment;
 use crate::state::*;
-use a3_core::ai::{self, AiConfig, AskAnswer, ConnectionTest, ReviewOutcome, Suggestion, WarningDraft};
+use a3_core::ai::{self, A3Summary, AiConfig, AskAnswer, ConnectionTest, ReviewOutcome, Suggestion, SummaryTone, WarningDraft};
 use a3_core::connect::{self, ConnectionProfile};
 use a3_core::domain::{self, LinkTarget};
 use a3_core::email::{self, EmailDraft};
@@ -462,6 +462,14 @@ pub async fn ai_review(app: AppHandle, state: S<'_>, sheet: Uuid) -> Result<Revi
 #[tauri::command]
 pub async fn ai_improve(app: AppHandle, state: S<'_>, sheet: Uuid, letter: String, selection: Option<String>) -> Result<Vec<Suggestion>> {
     ai_service(&app, &state.session()?)?.improve(sheet, &letter, selection.as_deref()).await
+}
+#[tauri::command]
+pub async fn ai_summarize(app: AppHandle, state: S<'_>, sheet: Uuid, tone: Option<SummaryTone>) -> Result<A3Summary> {
+    ai_service(&app, &state.session()?)?.summarize_with_tone(sheet, tone.unwrap_or_default()).await
+}
+#[tauri::command]
+pub async fn ai_apply_summary(state: S<'_>, sheet: Uuid, draft: A3Summary) -> Result<Vec<Step>> {
+    state.repo()?.apply_summary(sheet, &draft.steps).await
 }
 #[tauri::command]
 pub async fn ai_condense(app: AppHandle, state: S<'_>, sheet: Uuid, letter: String, target_chars: usize) -> Result<Vec<Suggestion>> {

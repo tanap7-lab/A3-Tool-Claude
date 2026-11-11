@@ -7,6 +7,7 @@ use crate::richtext;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::{Postgres, QueryBuilder};
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 pub(super) const PAGE_SIZE: i64 = 50;
@@ -236,6 +237,87 @@ impl SheetRepo for PgRepository {
     async fn acquire_lock(&self, step: Uuid) -> Result<Step> {
         sqlx::query!("SELECT acquire_step_lock($1)", step).fetch_one(&self.pool).await?;
         fetch_step(&self.pool, step).await
+    }
+
+    async fn apply_summary(&self, sheet: Uuid, changes: &[SummaryStep]) -> Result<Vec<Step>> {
+        let detail = self.sheet_detail(sheet).await?;
+        if !detail.sheet.can_edit {
+            return Err(CoreError::new("NO_PERMISSION", "Only project members can apply an A3 summary."));
+        }
+        let mut tx = self.pool.begin().await?;
+        let current = sqlx::query!(
+            "SELECT id, letter, version, content FROM a3_step WHERE sheet_id = $1 ORDER BY letter FOR UPDATE", sheet
+        ).fetch_all(&mut *tx).await?;
+        let withdrawn = sqlx::query_scalar!("SELECT withdrawn_at FROM a3_sheet WHERE id = $1 FOR UPDATE", sheet)
+            .fetch_one(&mut *tx).await?;
+        if withdrawn.is_some() {
+            return Err(CoreError::new("A3_WITHDRAWN", "This A3 has been withdrawn."));
+        }
+        if changes.len() != current.len() {
+            return Err(CoreError::invalid("The draft must include all four A3 steps."));
+        }
+        let mut ids = BTreeSet::new();
+        for change in changes {
+            let Some(step) = current.iter().find(|step| step.id == change.id && step.letter == change.letter) else {
+                return Err(CoreError::invalid("A draft step does not belong to this A3."));
+            };
+            if !ids.insert(change.id) {
+                return Err(CoreError::invalid("The draft repeats a step."));
+            }
+            if step.version != change.version || step.content != change.original {
+                return Err(CoreError::conflict("This A3 has changed since the draft was generated. Generate a new summary to compare."));
+            }
+            if change.content["type"] != "doc" || !change.content["content"].is_array() {
+                return Err(CoreError::invalid("A draft contains an invalid document."));
+            }
+        }
+        let mut destinations: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+        for change in changes {
+            for source in richtext::source_originals(&change.content) {
+                destinations.entry(source).or_default().insert(change.letter.clone());
+            }
+        }
+        let mut saved = Vec::new();
+        for step in &current {
+            let change = changes.iter().find(|c| c.id == step.id).ok_or_else(|| CoreError::invalid("The draft omits a step."))?;
+            if change.content != step.content {
+                sqlx::query!(
+                    "INSERT INTO a3_step_snapshot (step_id, sheet_id, letter, content, plain_text, version, author_id, reason)
+                     SELECT id, sheet_id, letter, content, plain_text, version, $2, 'accept' FROM a3_step WHERE id = $1",
+                    step.id, self.me.id
+                ).execute(&mut *tx).await?;
+                let plain = richtext::plain_text(&change.content);
+                let result = sqlx::query!(
+                    "UPDATE a3_step SET content = $2, plain_text = $3 WHERE id = $1 AND version = $4",
+                    step.id, change.content, plain, change.version
+                ).execute(&mut *tx).await?;
+                require_row(result.rows_affected(), "This step cannot be edited.")?;
+                sqlx::query!(
+                    "INSERT INTO a3_step_snapshot (step_id, sheet_id, letter, content, plain_text, version, author_id, reason)
+                     SELECT id, sheet_id, letter, content, plain_text, version, $2, 'accept' FROM a3_step WHERE id = $1",
+                    step.id, self.me.id
+                ).execute(&mut *tx).await?;
+            }
+            saved.push(fetch_step(&mut *tx, step.id).await?);
+        }
+        // Keep the accepted fact ledger aligned with moved, uniquely located source text.
+        for ((segment, original), letters) in destinations {
+            if letters.len() == 1 {
+                let letter = letters.iter().next().expect("one destination");
+                sqlx::query!(
+                    "UPDATE a3_fact SET letter = $2 WHERE sheet_id = $1 AND source_segment_id::text = $3
+                     AND text = $4 AND state = 'accepted' AND letter <> $2",
+                    sheet, letter, segment, original
+                ).execute(&mut *tx).await?;
+            }
+        }
+        sqlx::query!(
+            "INSERT INTO audit_event (actor_id, object_type, object_id, sheet_id, action, detail)
+             VALUES ($1, 'a3_sheet', $2, $2, 'summary_applied', $3)",
+            self.me.id, sheet, json!({"steps": changes.iter().filter(|c| c.content != c.original).map(|c| &c.letter).collect::<Vec<_>>()})
+        ).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(saved)
     }
 
     async fn release_lock(&self, step: Uuid) -> Result<()> {

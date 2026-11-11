@@ -1,5 +1,7 @@
 // Mirrors crates/a3-core/src/model.rs.
 
+import type { DocNode } from '../lib/doc';
+
 export type Letter = 'A' | 'B' | 'C' | 'D';
 export const LETTERS: Letter[] = ['A', 'B', 'C', 'D'];
 
@@ -325,6 +327,28 @@ export interface Suggestion {
   rewrite: string;
   why: string;
 }
+
+export interface SummaryStep {
+  id: string;
+  letter: Letter;
+  original: DocNode;
+  content: DocNode;
+  version: number;
+}
+
+export interface A3Summary {
+  steps: SummaryStep[];
+  note: string | null;
+  moves: { from: Letter; to: Letter; text: string }[];
+  tone: SummaryTone;
+}
+
+export type SummaryTone = 'plain' | 'executive' | 'technical';
+export const SUMMARY_TONES: { value: SummaryTone; label: string }[] = [
+  { value: 'plain', label: 'Plain English' },
+  { value: 'executive', label: 'Executive briefing' },
+  { value: 'technical', label: 'Technical report' },
+];
 
 export interface CitedSource {
   segmentId: string | null;

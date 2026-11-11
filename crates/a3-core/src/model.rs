@@ -178,6 +178,16 @@ pub struct SheetDetail {
     pub open_conflicts: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryStep {
+    pub id: Uuid,
+    pub letter: String,
+    pub original: Value,
+    pub content: Value,
+    pub version: i32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct NewSheet {

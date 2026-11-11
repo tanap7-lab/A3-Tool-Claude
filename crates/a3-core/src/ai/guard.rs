@@ -64,15 +64,19 @@ pub struct Tokens {
 
 pub fn tokens(text: &str) -> Tokens {
     let mut t = Tokens::default();
+    let mut measurements = Vec::new();
     for c in NUMBER.captures_iter(text) {
         let n = canon_number(&c[1]);
         if let Some(u) = c.get(2) {
             t.numbers_with_unit.insert((n.clone(), canon_unit(u.as_str())));
+            measurements.push(c.get(1).expect("number capture").start()..u.end());
         }
         t.numbers.insert(n);
     }
     for m in CODE.find_iter(text) {
-        t.codes.insert(m.as_str().to_lowercase());
+        if !measurements.iter().any(|range| range.start <= m.start() && m.end() <= range.end) {
+            t.codes.insert(m.as_str().to_lowercase());
+        }
     }
     for m in WORD.find_iter(text) {
         t.words.insert(m.as_str().to_lowercase());
@@ -131,6 +135,27 @@ pub fn unsupported_tokens(output: &str, input: &str) -> Vec<String> {
     bad.sort();
     bad.dedup();
     bad
+}
+
+/// Narrative quantities may use equivalent notation; original evidence is not rewritten here.
+pub fn unsupported_story_tokens(output: &str, input: &str) -> Vec<String> {
+    fn expand_thousands(text: &str) -> String {
+        static SHORT: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?P<prefix>^|[^0-9A-Za-z_./-])(?P<whole>\d+)(?:\.(?P<fraction>\d{1,3}))?[kK]\b").unwrap());
+        SHORT.replace_all(text, |c: &regex::Captures<'_>| {
+            let matched = c.get(0).expect("whole match");
+            let mut suffix = text[matched.end()..].chars();
+            if suffix.next().is_some_and(|c| ['-', '_', '/', '.'].contains(&c)) && suffix.next().is_some_and(|c| c.is_alphanumeric()) {
+                return matched.as_str().to_string();
+            }
+            let fraction = c.name("fraction").map_or("", |m| m.as_str());
+            let digits = format!("{}{}", &c["whole"], fraction);
+            match digits.parse::<u128>().ok().and_then(|n| n.checked_mul(10_u128.pow(3 - fraction.len() as u32))) {
+                Some(n) => format!("{}{n}", &c["prefix"]),
+                None => matched.as_str().to_string(),
+            }
+        }).into_owned()
+    }
+    unsupported_tokens(&expand_thousands(output), &expand_thousands(input))
 }
 
 /// Words that state how sure a claim is. A rewrite cannot add, drop or swap these.
@@ -210,6 +235,27 @@ mod tests {
     #[test]
     fn thousands_separators_read_the_same() {
         assert!(unsupported_tokens("The gap is 2500 pcs.", INPUT).is_empty());
+    }
+
+    #[test]
+    fn story_quantities_can_expand_thousands_without_changing_values_or_identifiers() {
+        assert!(unsupported_story_tokens("Approximately 68,000 were delivered.", "~68k delivered").is_empty());
+        assert!(unsupported_story_tokens("About 68,500 were delivered.", "About 68.5k were delivered.").is_empty());
+        assert!(unsupported_story_tokens("Approximately 68,000.", "Approximately 68k.").is_empty());
+        assert!(unsupported_story_tokens("About 0.09k were delivered.", "About 90 were delivered.").is_empty());
+        assert!(!unsupported_story_tokens("Approximately 68,001 were delivered.", "~68k delivered").is_empty());
+        assert!(!unsupported_story_tokens("Part PN-68000 failed.", "Part PN-68k failed.").is_empty());
+        assert!(!unsupported_story_tokens("Part 68000-42 failed.", "Part 68k-42 failed.").is_empty());
+        assert!(!unsupported_tokens("Approximately 68,000 were delivered.", "~68k delivered").is_empty(), "detailed evidence keeps its stricter wording rule");
+    }
+
+    #[test]
+    fn measurement_spacing_does_not_create_spurious_part_codes() {
+        assert_eq!(phrasing_violation("The gap is 0.09 mm.", "The gap is 0.09mm."), None);
+        assert_eq!(phrasing_violation("The gap is 0.09mm.", "The gap is 0.09 mm."), None);
+        assert_eq!(phrasing_violation("Over 5 days.", "Over 5days."), None);
+        assert!(!unsupported_tokens("The gap is 0.09cm.", "The gap is 0.09 mm.").is_empty());
+        assert!(!unsupported_tokens("The gap is 0.08mm.", "The gap is 0.09 mm.").is_empty());
     }
 
     #[test]

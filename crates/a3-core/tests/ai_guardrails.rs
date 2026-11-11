@@ -255,6 +255,470 @@ async fn phrasing_cannot_change_facts_and_passes_g6() {
     assert!(step_of(&now, "B").plain_text.starts_with("The suspected cause may be"));
 }
 
+fn summary_plan(rewrites: serde_json::Value) -> serde_json::Value {
+    json!({"steps": [
+        {"letter": "A", "blocks": ["A.0"], "story": []},
+        {"letter": "B", "blocks": ["B.0"], "story": []},
+        {"letter": "C", "blocks": ["C.0"], "story": []},
+        {"letter": "D", "blocks": ["D.0"], "story": []}
+    ], "rewrites": rewrites})
+}
+
+fn story(text: &str, sources: &[&str]) -> serde_json::Value {
+    json!([{"text": text, "sources": sources}])
+}
+
+#[tokio::test]
+async fn summary_rephrases_and_moves_blocks_with_full_context_without_losing_sources() {
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    let original = json!({"type": "doc", "content": [
+        a3_core::richtext::sourced_paragraph("Target for scrap: 1.0%.", Some("source-1"), Some("Report, page 1"), false),
+        a3_core::richtext::sourced_paragraph("Temporary sorting, status: ongoing.", Some("source-2"), Some("Report, page 2"), true),
+        {"type": "image", "attrs": {"src": "data:image/png;base64,AA=="}},
+        {"type": "table", "content": [{"type": "tableRow", "content": [
+            {"type": "tableCell", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Measured gap"}]}]}
+        ]}]}
+    ]});
+    let saved = t.owner.save_step(step_of(&d, "A").id, step_of(&d, "A").version, &original).await.unwrap();
+    add_text_file(t.owner.clone(), d.sheet.id, "context.txt", "The sensor on line 4 failed intermittently.").await;
+    let mut plan = summary_plan(json!([
+        {"node": "A.0.0", "rewrite": "The target for scrap is 1.0%."},
+        {"node": "A.1.0", "rewrite": "Temporary sorting is ongoing."}
+    ]));
+    plan["steps"][0]["blocks"] = json!(["A.0", "A.2", "A.3"]);
+    plan["steps"][2]["blocks"] = json!(["A.1", "C.0"]);
+    plan["steps"][0]["story"] = story("The target for scrap is 1.0%.", &["A.0"]);
+    plan["steps"][2]["story"] = story("Temporary sorting is ongoing.", &["A.1"]);
+    let mock = MockProvider::new(vec![plan, json!({"rejected_ids": []})]);
+    let summary = service(t.owner.clone(), mock.clone()).summarize(d.sheet.id).await.unwrap();
+    let a = &summary.steps[0];
+    let c = &summary.steps[2];
+    assert_eq!(a.original, original);
+    assert_eq!(a.version, saved.version);
+    assert_eq!(a3_core::richtext::plain_text(&a3_core::richtext::summary_evidence(&a.content)), "The target for scrap is 1.0%.\nMeasured gap");
+    assert_eq!(a3_core::richtext::plain_text(&a3_core::richtext::summary_evidence(&c.content)), "Temporary sorting is ongoing.");
+    assert_eq!(summary.moves.len(), 1);
+    assert_eq!((&summary.moves[0].from[..], &summary.moves[0].to[..]), ("A", "C"));
+    let first = &c.content["content"][1]["content"][0]["content"][0];
+    assert_eq!(first["marks"][0]["attrs"]["segmentId"], "source-2");
+    assert_eq!(first["marks"][0]["attrs"]["original"], "Temporary sorting, status: ongoing.");
+    assert_eq!(first["marks"][0]["attrs"]["edited"], true);
+    assert_eq!(first["marks"][0]["attrs"]["fromImage"], true);
+    assert_eq!(a.content["content"][1]["content"][1], original["content"][2]);
+    assert_eq!(a.content["content"][1]["content"][2], original["content"][3]);
+    assert_eq!(step_of(&t.owner.sheet_detail(d.sheet.id).await.unwrap(), "A").content, original);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].user.contains("Step A") && requests[0].user.contains("Step D"));
+    assert!(requests[0].user.contains("failed intermittently"), "attachment passages included");
+    assert!(requests[1].user.contains("A.0.0"));
+    assert!(requests[1].system.contains("both directions"), "check both added and missing claims in one pair");
+    let checked: Vec<serde_json::Value> = serde_json::from_str(&requests[1].user).unwrap();
+    assert!(checked.iter().any(|p| p["id"] == "story:C.0"));
+    assert_eq!(requests[0].user.matches("Temporary sorting, status: ongoing.").count(), 1, "step text sent once");
+    t.owner.apply_summary(d.sheet.id, &summary.steps).await.unwrap();
+    let now = t.owner.sheet_detail(d.sheet.id).await.unwrap();
+    assert_eq!(step_of(&now, "C").content, c.content);
+    assert_eq!(step_of(&now, "A").content, a.content);
+    assert!(t.owner.snapshots(d.sheet.id).await.unwrap().iter().any(|s| s.content == original && s.reason == "accept"));
+}
+
+#[tokio::test]
+async fn summary_synthesizes_multiple_sources_without_growing_on_regeneration() {
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    let evidence = json!({"type": "doc", "content": [
+        a3_core::richtext::sourced_paragraph("Sensor failures: intermittent. Line: 4.", Some("source-1"), Some("Page 1"), false),
+        a3_core::richtext::sourced_paragraph("Customer returns: 39. Additional inspection remains ongoing.", Some("source-2"), Some("Page 2"), true)
+    ]});
+    t.owner.save_step(step_of(&d, "A").id, step_of(&d, "A").version, &evidence).await.unwrap();
+    let narrative = "The sensor on line 4 fails intermittently; there were 39 customer returns.";
+    let mut plan = summary_plan(json!([]));
+    plan["steps"][0]["blocks"] = json!(["A.0", "A.1"]);
+    plan["steps"][0]["story"] = story(narrative, &["A.0", "A.1"]);
+    let mock = MockProvider::new(vec![plan.clone(), json!({"rejected_ids": []}), plan, json!({"rejected_ids": []})]);
+    let ai = service(t.owner.clone(), mock.clone());
+    let first = ai.summarize(d.sheet.id).await.unwrap();
+    let proposed = &first.steps[0].content;
+    assert_eq!(proposed["content"][0]["content"][0]["content"][0]["text"], narrative);
+    assert_eq!(proposed["content"][0]["content"][0]["content"][0]["marks"].as_array().unwrap().len(), 2);
+    assert_eq!(proposed["content"][1]["content"], evidence["content"], "secondary detail remains intact");
+    let pairs: Vec<serde_json::Value> = serde_json::from_str(&mock.requests()[1].user).unwrap();
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0]["id"], "story:A.0");
+    assert!(pairs[0]["original"].as_str().unwrap().contains("inspection remains ongoing"));
+    t.owner.apply_summary(d.sheet.id, &first.steps).await.unwrap();
+    let second = ai.summarize(d.sheet.id).await.unwrap();
+    assert_eq!(second.steps[0].original, *proposed, "stale checks use the real stored document");
+    assert_eq!(second.steps[0].content, *proposed, "repeat summaries replace the lead and do not nest evidence");
+    assert!(!mock.requests()[2].user.contains(narrative), "generated prose is not re-used as factual evidence");
+}
+
+#[tokio::test]
+async fn summary_corrects_missing_or_unsupported_stories_once_for_every_tone() {
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    fill_step(&t.owner, d.sheet.id, "A", "The sensor failed intermittently. There were 39 returns.").await;
+    let valid = story("The sensor failed intermittently, with 39 returns.", &["A.0"]);
+    let invalid_stories = [
+        json!([]),
+        story("", &["A.0"]),
+        story("The sensor failed.", &[]),
+        story("The sensor failed.", &["A.99"]),
+        story("The sensor failed.", &["B.0"]),
+        story("The sensor failed.", &["A.0", "A.0"]),
+        story("There were 999 returns.", &["A.0"]),
+    ];
+    for tone in [a3_core::ai::SummaryTone::Plain, a3_core::ai::SummaryTone::Executive, a3_core::ai::SummaryTone::Technical] {
+        for invalid in &invalid_stories {
+            let mut plan = summary_plan(json!([]));
+            plan["steps"][0]["story"] = invalid.clone();
+            let mock = MockProvider::new(vec![
+                plan,
+                json!({"steps": [{"letter": "A", "story": valid.clone()}]}),
+                json!({"rejected_ids": []}),
+            ]);
+            let draft = service(t.owner.clone(), mock.clone()).summarize_with_tone(d.sheet.id, tone).await.unwrap();
+            assert_eq!(draft.steps[0].content["content"][0]["content"][0]["content"][0]["text"], "The sensor failed intermittently, with 39 returns.");
+            assert!(draft.note.unwrap().contains("automatically corrected"));
+            let requests = mock.requests();
+            assert_eq!(requests.len(), 3, "one draft, one targeted correction, one fact check");
+            assert!(requests[1].system.contains(tone.instruction()));
+            assert!(requests[1].fast);
+            assert!(requests[1].user.contains("placed_blocks") && requests[1].user.contains("problems"));
+            let pairs: Vec<serde_json::Value> = serde_json::from_str(&requests[2].user).unwrap();
+            assert_eq!(pairs.len(), 1);
+            assert_eq!(pairs[0]["id"], "story:A.0");
+            assert!(!pairs[0]["rewrite"].as_str().unwrap().contains("999"));
+        }
+    }
+    let mut plan = summary_plan(json!([]));
+    plan["steps"][0]["story"] = story("The sensor failed.", &["A.0"]);
+    let err = service(t.owner.clone(), MockProvider::new(vec![plan, json!({"rejected_ids": ["story:A.0"]})]))
+        .summarize(d.sheet.id).await.unwrap_err();
+    assert_eq!(err.code, "AI_FAILED", "the verifier can reject lost qualification or invented causality in a lead");
+    assert_eq!(step_of(&t.owner.sheet_detail(d.sheet.id).await.unwrap(), "A").plain_text, "The sensor failed intermittently. There were 39 returns.");
+}
+
+#[tokio::test]
+async fn summary_readability_targets_are_not_hard_limits_and_equivalent_quantities_pass() {
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    let source = "The sensor failed intermittently. ~68k units were delivered. Investigation remains ongoing. The gap measured 0.09 mm.";
+    fill_step(&t.owner, d.sheet.id, "A", source).await;
+    for tone in [a3_core::ai::SummaryTone::Plain, a3_core::ai::SummaryTone::Executive, a3_core::ai::SummaryTone::Technical] {
+        for (words, paragraphs) in [(90, 3), (100, 3), (113, 3), (160, 4)] {
+            let sentence = "The sensor failed intermittently. Approximately 68,000 units were delivered. Investigation remains ongoing. The gap measured 0.09mm.";
+            let text: Vec<_> = sentence.split_whitespace().cycle().take(words).collect();
+            let chunk_size = words.div_ceil(paragraphs);
+            let story: Vec<_> = text.chunks(chunk_size).map(|p| json!({"text": p.join(" "), "sources": ["A.0"]})).collect();
+            let mut plan = summary_plan(json!([]));
+            plan["steps"][0]["story"] = json!(story);
+            let mock = MockProvider::new(vec![plan, json!({"rejected_ids": []})]);
+            let draft = service(t.owner.clone(), mock.clone()).summarize_with_tone(d.sheet.id, tone).await.unwrap();
+            let lead = &draft.steps[0].content["content"][0]["content"];
+            let actual: usize = lead.as_array().unwrap().iter().map(|p| a3_core::richtext::plain_text(p).split_whitespace().count()).sum();
+            assert_eq!(actual, words);
+            assert_eq!(mock.requests().len(), 2, "readability targets do not trigger correction calls");
+            assert!(draft.note.is_none());
+            assert_eq!(a3_core::richtext::plain_text(&a3_core::richtext::summary_evidence(&draft.steps[0].content)), source);
+            assert!(mock.requests()[1].system.contains("Approximate amounts must remain approximate"));
+        }
+    }
+    let mut plan = summary_plan(json!([]));
+    plan["steps"][0]["story"] = story("68,000 units were delivered.", &["A.0"]);
+    let mock = MockProvider::new(vec![
+        plan,
+        json!({"rejected_ids": ["story:A.0"]}),
+        json!({"steps": [{"letter": "A", "story": story("Approximately 68,000 units were delivered.", &["A.0"])}]}),
+        json!({"rejected_ids": []}),
+    ]);
+    let draft = service(t.owner.clone(), mock.clone()).summarize(d.sheet.id).await.unwrap();
+    assert_eq!(draft.steps[0].content["content"][0]["content"][0]["content"][0]["text"], "Approximately 68,000 units were delivered.");
+    assert_eq!(mock.requests().len(), 4, "the semantic verifier can still reject dropped approximation and require correction");
+}
+
+#[tokio::test]
+async fn summary_rejects_invalid_structure_and_missing_blocks() {
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    fill_step(&t.owner, d.sheet.id, "B", "The suspected cause may be a worn die on line 4.").await;
+    let mut omitted_block = summary_plan(json!([]));
+    omitted_block["steps"][0]["blocks"] = json!([]);
+    let mut repeated_block = summary_plan(json!([]));
+    repeated_block["steps"][0]["blocks"] = json!(["A.0", "A.0"]);
+    let mut unknown_block = summary_plan(json!([]));
+    unknown_block["steps"][0]["blocks"] = json!(["A.99"]);
+    let mut repeated_step = summary_plan(json!([]));
+    repeated_step["steps"][0]["letter"] = json!("B");
+    for plan in [
+        omitted_block, repeated_block, unknown_block, repeated_step,
+        json!({"steps": [], "rewrites": []}),
+        summary_plan(json!([{"node": "S99", "rewrite": "Something else."}])),
+        summary_plan(json!([{"node": "B.0.0", "rewrite": ""}])),
+        summary_plan(json!([
+            {"node": "B.0.0", "rewrite": "The suspected cause may be a worn die on line 4."},
+            {"node": "B.0.0", "rewrite": "The suspected cause may be a worn die on line 4."}
+        ])),
+    ] {
+        let mock = MockProvider::new(vec![plan]);
+        let err = service(t.owner.clone(), mock.clone()).summarize(d.sheet.id).await.unwrap_err();
+        assert_eq!(err.code, "AI_FAILED");
+        assert_eq!(mock.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn summary_fails_visibly_when_semantics_or_verification_fail() {
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    fill_step(&t.owner, d.sheet.id, "A", "The sensor failed intermittently.").await;
+    let mut plan = summary_plan(json!([]));
+    plan["steps"][0]["story"] = story("The sensor failed.", &["A.0"]);
+    for replies in [
+        vec![plan.clone(), json!({"rejected_ids": ["story:A.0"]})],
+        vec![plan.clone(), json!({"rejected_ids": ["UNKNOWN"]})],
+        vec![plan],
+    ] {
+        let err = service(t.owner.clone(), MockProvider::new(replies)).summarize(d.sheet.id).await.unwrap_err();
+        assert_eq!(err.code, "AI_FAILED");
+    }
+    let run: (String, i32) = sqlx::query_as("SELECT outcome, discarded_count FROM ai_run WHERE sheet_id = $1 AND job = 'summarize' ORDER BY created_at DESC LIMIT 1")
+        .bind(d.sheet.id).fetch_one(t.owner.pool()).await.unwrap();
+    assert_eq!(run.0, "failed");
+    assert!(run.1 > 0);
+    assert_eq!(step_of(&t.owner.sheet_detail(d.sheet.id).await.unwrap(), "A").plain_text, "The sensor failed intermittently.");
+}
+
+#[tokio::test]
+async fn summary_keeps_rejected_detail_edits_without_blocking_a_verified_story() {
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    let original = "The suspected cause may be a worn die on line 4.";
+    fill_step(&t.owner, d.sheet.id, "B", original).await;
+    for tone in [a3_core::ai::SummaryTone::Plain, a3_core::ai::SummaryTone::Executive, a3_core::ai::SummaryTone::Technical] {
+        for rewrite in [
+            "The suspected cause may be a worn die on line 5.",
+            "The confirmed cause is a worn die on line 4.",
+        ] {
+            let mut plan = summary_plan(json!([{"node": "B.0.0", "rewrite": rewrite}]));
+            plan["steps"][1]["story"] = story("Investigation: the suspected cause may be a worn die on line 4.", &["B.0"]);
+            let mock = MockProvider::new(vec![plan, json!({"rejected_ids": []})]);
+            let draft = service(t.owner.clone(), mock.clone()).summarize_with_tone(d.sheet.id, tone).await.unwrap();
+            assert_eq!(a3_core::richtext::plain_text(&a3_core::richtext::summary_evidence(&draft.steps[1].content)), original);
+            assert!(draft.note.unwrap().contains("1 supporting passage(s) were kept unchanged"));
+            let requests = mock.requests();
+            assert_eq!(requests.len(), 2, "a rejected optional detail edit does not regenerate the whole draft");
+            assert!(!requests[1].user.contains(rewrite));
+        }
+    }
+    let run: (String, i32) = sqlx::query_as("SELECT outcome, discarded_count FROM ai_run WHERE sheet_id = $1 AND job = 'summarize' ORDER BY created_at DESC LIMIT 1")
+        .bind(d.sheet.id).fetch_one(t.owner.pool()).await.unwrap();
+    assert_eq!(run.0, "ok");
+    assert!(run.1 > 0, "rejected detail edits are logged, not silently accepted");
+
+    fill_step(&t.owner, d.sheet.id, "A", "The sensor failed intermittently.").await;
+    let mut plan = summary_plan(json!([{"node": "A.0.0", "rewrite": "The sensor failed."}]));
+    plan["steps"][0]["story"] = story("The sensor failed intermittently.", &["A.0"]);
+    plan["steps"][1]["story"] = story(original, &["B.0"]);
+    let mock = MockProvider::new(vec![plan, json!({"rejected_ids": ["A.0.0"]})]);
+    let draft = service(t.owner.clone(), mock.clone()).summarize(d.sheet.id).await.unwrap();
+    assert_eq!(a3_core::richtext::plain_text(&a3_core::richtext::summary_evidence(&draft.steps[0].content)), "The sensor failed intermittently.");
+    assert!(draft.note.unwrap().contains("kept unchanged"));
+    assert_eq!(mock.requests().len(), 2, "semantically unsafe detail edits are also reverted without losing the story");
+}
+
+#[tokio::test]
+async fn summary_repairs_source_scope_and_semantics_without_changing_placements() {
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    let details = json!({"type": "doc", "content": [
+        a3_core::richtext::sourced_paragraph("The sensor failed intermittently.", Some("source-1"), Some("Page 1"), false),
+        a3_core::richtext::sourced_paragraph("There were 39 returns.", Some("source-2"), Some("Page 2"), false)
+    ]});
+    t.owner.save_step(step_of(&d, "A").id, step_of(&d, "A").version, &details).await.unwrap();
+    let fixed = story("The sensor failed intermittently; there were 39 returns.", &["A.0", "A.1"]);
+    for semantic in [false, true] {
+        let mut plan = summary_plan(json!([]));
+        plan["steps"][0]["blocks"] = json!(["A.0", "A.1"]);
+        plan["steps"][0]["story"] = if semantic {
+            story("The sensor failed; there were 39 returns.", &["A.0", "A.1"])
+        } else {
+            story("The sensor failed intermittently; there were 39 returns.", &["A.0"])
+        };
+        let mut replies = vec![plan];
+        if semantic {
+            replies.push(json!({"rejected_ids": ["story:A.0"]}));
+        }
+        replies.extend([json!({"steps": [{"letter": "A", "story": fixed.clone()}]}), json!({"rejected_ids": []})]);
+        let mock = MockProvider::new(replies);
+        let draft = service(t.owner.clone(), mock.clone()).summarize(d.sheet.id).await.unwrap();
+        assert_eq!(draft.steps[0].content["content"][1]["content"], details["content"]);
+        assert_eq!(a3_core::richtext::source_refs(&draft.steps[0].content["content"][0]).len(), 2);
+        assert!(draft.moves.is_empty());
+        assert_eq!(mock.requests().len(), if semantic { 4 } else { 3 });
+        let repair_input = &mock.requests()[if semantic { 2 } else { 1 }].user;
+        assert!(repair_input.contains("A.0") && repair_input.contains("A.1"));
+    }
+}
+
+#[tokio::test]
+async fn summary_repair_is_bounded_and_never_uses_an_invalid_correction() {
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    fill_step(&t.owner, d.sheet.id, "A", "The sensor failed intermittently. There were 39 returns.").await;
+    let mut plan = summary_plan(json!([]));
+    plan["steps"][0]["story"] = story("There were 999 returns.", &["A.0"]);
+    for correction in [
+        json!({"steps": []}),
+        json!({"steps": [{"letter": "B", "story": story("There were 39 returns.", &["B.0"])}]}),
+        json!({"steps": [{"letter": "A", "story": story("There were 999 returns.", &["A.0"])}]}),
+        json!({"steps": [{"letter": "A", "story": story("There were 39 returns.", &["A.99"])}]}),
+    ] {
+        let mock = MockProvider::new(vec![plan.clone(), correction]);
+        let err = service(t.owner.clone(), mock.clone()).summarize(d.sheet.id).await.unwrap_err();
+        assert_eq!(err.code, "AI_FAILED");
+        assert_eq!(mock.requests().len(), 2, "do not retry invalid corrections indefinitely");
+    }
+    let correction = json!({"steps": [{"letter": "A", "story": story("The sensor failed.", &["A.0"])}]});
+    let mock = MockProvider::new(vec![plan, correction, json!({"rejected_ids": ["story:A.0"]})]);
+    assert!(service(t.owner.clone(), mock.clone()).summarize(d.sheet.id).await.is_err());
+    assert_eq!(mock.requests().len(), 3, "a corrected story must still pass semantic verification");
+    assert_eq!(step_of(&t.owner.sheet_detail(d.sheet.id).await.unwrap(), "A").plain_text, "The sensor failed intermittently. There were 39 returns.");
+}
+
+#[tokio::test]
+async fn summary_handles_unchanged_empty_closed_and_disabled_steps() {
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    let mut moves_closed = summary_plan(json!([]));
+    moves_closed["steps"][0]["blocks"] = json!([]);
+    moves_closed["steps"][2]["blocks"] = json!(["A.0", "C.0"]);
+    let mut unchanged = summary_plan(json!([]));
+    unchanged["steps"][0]["story"] = story("The sensor failed.", &["A.0"]);
+    let mock = MockProvider::new(vec![unchanged, json!({"rejected_ids": []}), moves_closed]);
+    let ai = service(t.owner.clone(), mock.clone());
+    assert!(ai.summarize(d.sheet.id).await.is_err(), "empty A3");
+    fill_step(&t.owner, d.sheet.id, "A", "The sensor failed.").await;
+    let summary = ai.summarize(d.sheet.id).await.unwrap();
+    assert_eq!(summary.steps[0].content["content"][0]["type"], "a3Narrative");
+    assert!(summary.steps[1..].iter().all(|s| s.original == s.content));
+    t.owner.close_step(step_of(&d, "A").id).await.unwrap();
+    assert!(ai.summarize(d.sheet.id).await.is_err(), "moving out of a closed step");
+    t.owner.set_project_ai(t.project.id, false).await.unwrap();
+    assert_eq!(ai.summarize(d.sheet.id).await.unwrap_err().code, "AI_OFF");
+    assert_eq!(mock.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn summary_apply_is_atomic_checks_all_versions_and_keeps_fact_locations() {
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    let att = add_text_file(t.owner.clone(), d.sheet.id, "action.txt", "Temporary sorting started.").await;
+    let mock = MockProvider::new(vec![reply(vec![point("new", "A", "Temporary sorting started.", "S1", "Temporary sorting started.")])]);
+    service(t.owner.clone(), mock).import_attachment(att.id).await.unwrap();
+    for p in t.owner.proposals(d.sheet.id, true).await.unwrap() {
+        t.owner.decide_proposal(p.id, &ProposalDecision::Accept { text: None }).await.unwrap();
+    }
+    let mut plan = summary_plan(json!([]));
+    plan["steps"][0]["blocks"] = json!([]);
+    plan["steps"][2]["blocks"] = json!(["A.0", "C.0"]);
+    plan["steps"][2]["story"] = story("Temporary sorting started.", &["A.0"]);
+    let ai = service(t.owner.clone(), MockProvider::new(vec![plan.clone(), json!({"rejected_ids": []})]));
+    let draft = ai.summarize(d.sheet.id).await.unwrap();
+    assert!(t.outsider.apply_summary(d.sheet.id, &draft.steps).await.is_err());
+    t.member.acquire_lock(step_of(&d, "C").id).await.unwrap();
+    let before = t.owner.snapshot_count(d.sheet.id).await.unwrap();
+    assert!(t.owner.apply_summary(d.sheet.id, &draft.steps).await.is_err(), "lock on C must roll back A");
+    assert_eq!(step_of(&t.owner.sheet_detail(d.sheet.id).await.unwrap(), "A").content, draft.steps[0].original);
+    assert_eq!(t.owner.snapshot_count(d.sheet.id).await.unwrap(), before, "snapshots rolled back too");
+    t.member.release_lock(step_of(&d, "C").id).await.unwrap();
+    fill_step(&t.owner, d.sheet.id, "D", "Validation pending.").await;
+    assert_eq!(t.owner.apply_summary(d.sheet.id, &draft.steps).await.unwrap_err().code, "STALE", "even an unchanged section is context");
+    plan["steps"][3]["story"] = story("Validation is pending.", &["D.0"]);
+    let fresh = service(t.owner.clone(), MockProvider::new(vec![plan, json!({"rejected_ids": []})])).summarize(d.sheet.id).await.unwrap();
+    let mut malformed = fresh.steps.clone();
+    malformed[1] = malformed[0].clone();
+    assert!(t.owner.apply_summary(d.sheet.id, &malformed).await.is_err());
+    t.owner.apply_summary(d.sheet.id, &fresh.steps).await.unwrap();
+    let facts = t.owner.facts(d.sheet.id).await.unwrap();
+    assert!(facts.iter().any(|f| f.text == "Temporary sorting started." && f.letter == "C"));
+    assert_eq!(t.owner.apply_summary(d.sheet.id, &fresh.steps).await.unwrap_err().code, "STALE");
+}
+
+#[tokio::test]
+async fn summary_tones_reach_the_model_and_verification_is_bounded() {
+    use a3_core::ai::SummaryTone;
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    let blocks: Vec<_> = (0..17).map(|i| json!({"type": "paragraph", "content": [{"type": "text", "text": format!("Original text for item {i}.")}]})).collect();
+    t.owner.save_step(step_of(&d, "A").id, step_of(&d, "A").version, &json!({"type": "doc", "content": blocks})).await.unwrap();
+    for tone in [SummaryTone::Plain, SummaryTone::Executive, SummaryTone::Technical] {
+        let edits: Vec<_> = (0..17).map(|i| json!({"node": format!("A.{i}.0"), "rewrite": format!("Item {i} has original text.")})).collect();
+        let mut plan = summary_plan(json!(edits));
+        plan["steps"][0]["blocks"] = json!((0..17).map(|i| format!("A.{i}")).collect::<Vec<_>>());
+        plan["steps"][0]["story"] = story("Item 0 has original text.", &["A.0"]);
+        let mock = MockProvider::new(vec![plan, json!({"rejected_ids": []}), json!({"rejected_ids": []}), json!({"rejected_ids": []})]);
+        let draft = service(t.owner.clone(), mock.clone()).summarize_with_tone(d.sheet.id, tone).await.unwrap();
+        assert_eq!(draft.tone, tone);
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 4, "one generation plus 3 bounded verification batches");
+        assert!(requests[0].system.contains(tone.instruction()));
+        assert!(requests.iter().all(|r| r.fast));
+        let mut checked = Vec::new();
+        for req in &requests[1..] {
+            assert_eq!(req.max_tokens, 4096);
+            let pairs: Vec<serde_json::Value> = serde_json::from_str(&req.user).unwrap();
+            assert!(pairs.len() <= 8);
+            checked.extend(pairs.into_iter().map(|p| p["id"].as_str().unwrap().to_string()));
+        }
+        checked.sort();
+        checked.dedup();
+        assert_eq!(checked.len(), 18, "all 17 rewrites and the narrative verified exactly once");
+    }
+}
+
+#[tokio::test]
+async fn summary_retries_only_the_truncated_check_with_more_space() {
+    use a3_core::ai::{AiProvider, Completion, CompletionRequest};
+    use std::sync::{Mutex, atomic::{AtomicBool, Ordering}};
+    struct TruncatedCheck {
+        inner: Arc<MockProvider>,
+        truncated: AtomicBool,
+        budgets: Mutex<Vec<u32>>,
+    }
+    #[async_trait::async_trait]
+    impl AiProvider for TruncatedCheck {
+        fn name(&self) -> &str { "mock" }
+        fn model(&self) -> &str { "mock" }
+        async fn complete(&self, req: &CompletionRequest) -> a3_core::Result<Completion> {
+            if req.system == a3_core::ai::prompts::SUMMARY_VERIFY_SYSTEM {
+                self.budgets.lock().unwrap().push(req.max_tokens);
+                if !self.truncated.swap(true, Ordering::SeqCst) {
+                    return Err(a3_core::CoreError::new("AI_TRUNCATED", "Reply cut off."));
+                }
+            }
+            self.inner.complete(req).await
+        }
+        async fn list_models(&self) -> a3_core::Result<Vec<String>> { Ok(vec![]) }
+    }
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    fill_step(&t.owner, d.sheet.id, "A", "Temporary sorting, status: ongoing.").await;
+    let mut plan = summary_plan(json!([{"node": "A.0.0", "rewrite": "Temporary sorting is ongoing."}]));
+    plan["steps"][0]["story"] = story("Temporary sorting is ongoing.", &["A.0"]);
+    let mock = MockProvider::new(vec![
+        plan,
+        json!({"rejected_ids": []}),
+    ]);
+    let provider = Arc::new(TruncatedCheck { inner: mock.clone(), truncated: AtomicBool::new(false), budgets: Mutex::new(vec![]) });
+    let ai = a3_core::ai::AiService::new(t.owner.clone(), provider.clone());
+    ai.summarize(d.sheet.id).await.unwrap();
+    assert_eq!(*provider.budgets.lock().unwrap(), vec![4096, 8192]);
+    assert_eq!(mock.requests().len(), 2, "generation is not repeated");
+}
+
 #[tokio::test]
 async fn a_complete_a3_can_return_zero_findings_and_dismissals_stick() {
     let t = team().await;

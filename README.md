@@ -43,6 +43,24 @@ npx tauri build --debug --no-bundle
 
 The end-to-end run drives the app through WebView2 against the real database. It uses a local OpenAI-compatible mock (`e2e/mock-ai.mjs`) that also plants a fake number in every import, so the G5 check has something to catch. It writes screenshots to `.dev\e2e\shots` and every export format to `.dev\e2e\exports`.
 
+## Turning imported notes into readable sections
+
+Import review keeps the attachment's wording for traceability. After accepting the relevant proposals, click **Review & summarize A3** on the Sheet tab. AI reviews all four sections, metadata, accepted facts and available source passages together to propose clearer wording and moves into the appropriate A/B/C/D sections. Configure AI in Settings first.
+
+The default **Readable draft** preview shows each section's **At a glance** story: related evidence synthesized into a coherent account, rather than merely rearranged notes. Usually this is one to three short paragraphs around 60-120 words, but length and paragraph count are guidelines, not rejection rules. Expand **Supporting evidence and details** for the complete underlying content, or switch to **Highlighted changes** to inspect additions and deletions. The story and its evidence are saved together only when you choose **Apply all changes**; **Dismiss** leaves the A3 unchanged. Application is atomic. Changes to any section invalidate an old draft; closed sections remain unchanged. Before/after snapshots and an audit entry are saved on acceptance.
+
+Story paragraphs can combine related points from multiple placed blocks and retain links to all their attachment sources. Secondary detail may be omitted from the short lead, but is retained in full below it; no unaccepted attachment facts or unsupported causal links may be added. The evidence blocks can be reordered or transferred between steps without losing source chips, formatting, tables or images. Detailed rewrites must still preserve every fact. Numbers, dates, names, units and certainty are checked, and an independent model check verifies that the story's claims are supported. Accepted fact locations follow moved source text. If source passages exceed the context budget, the review shows its coverage. **Improve** remains available for up to three individual sentence suggestions.
+
+An incorrectly cited or ungrounded story gets at most one automatic correction, limited to affected sections, followed by validation and fact-checking again. Reasonable drafts are not rejected just for exceeding a word or paragraph target. Equivalent quantity notation is accepted in stories (for example, `~68k` can become `approximately 68,000`, and `0.09 mm` can become `0.09mm`); approximation, values, units and identifiers must still be preserved and pass the semantic fact-check. An optional supporting-detail rewrite that fails a factual check is discarded individually: the original passage stays intact, and the preview's **Review notes** explains this. One rejected detail edit no longer prevents a valid story from being reviewed. Corrections cannot change block placements or bypass the factual checks; if correction fails, nothing is applied.
+
+The editor collapses supporting details by default; exports include both the story and all supporting details. Regenerating replaces an unedited generated lead instead of repeatedly appending summaries. Manual edits to a previous lead are retained as supporting details in the next draft.
+
+Choose **Plain English**, **Executive briefing**, or **Technical report** before generating. You can also change the tone in the comparison preview and click **Regenerate with this tone**. The preview labels the tone actually used; applying is disabled during regeneration or when the selected tone does not match the reviewed draft. Failed regeneration leaves the previous preview intact and shows an error.
+
+Preview differences are cached while the generation timer updates. Very large sections use a coarser changed-passage highlight instead of allocating an unbounded word-diff matrix; both the current and proposed text are retained in full.
+
+Summary requests send section text only once while retaining all four sections and the existing contextual memory. Fact checks compare detailed rewrites in both directions and check story claims for support, in batches of up to eight pairs (or about 12 KB of text), with at most two batches in flight. A truncated check gets one larger-budget retry without regenerating the draft. The AI phase has a three-minute deadline and reports failure without modifying the A3. For supported models on the official DeepSeek endpoint, summary editing/checking uses [non-thinking mode](https://api-docs.deepseek.com/guides/thinking_mode) to avoid the provider's default high-effort reasoning; other AI jobs and other endpoints are unchanged.
+
 ## Building the installer
 
 ```powershell

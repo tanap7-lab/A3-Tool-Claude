@@ -51,6 +51,7 @@ pub trait SheetRepo: Send + Sync {
     async fn update_sheet(&self, sheet: Uuid, patch: &SheetPatch) -> Result<()>;
     async fn withdraw_sheet(&self, sheet: Uuid, reason: &str) -> Result<()>;
     async fn save_step(&self, step: Uuid, expected_version: i32, content: &Value) -> Result<Step>;
+    async fn apply_summary(&self, sheet: Uuid, steps: &[SummaryStep]) -> Result<Vec<Step>>;
     async fn acquire_lock(&self, step: Uuid) -> Result<Step>;
     async fn release_lock(&self, step: Uuid) -> Result<()>;
     async fn close_step(&self, step: Uuid) -> Result<()>;

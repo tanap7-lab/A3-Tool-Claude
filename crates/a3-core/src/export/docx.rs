@@ -130,6 +130,11 @@ fn step_blocks(doc: &Value, size: usize, max_width: u32) -> Vec<Block> {
     let mut out = Vec::new();
     for node in children(doc) {
         match node.get("type").and_then(Value::as_str).unwrap_or("") {
+            "a3Narrative" | "a3Evidence" => {
+                let heading = if node["type"] == "a3Narrative" { "At a glance" } else { "Supporting evidence and details" };
+                out.push(Block::Para(Paragraph::new().add_run(run(heading, size, true, false, None))));
+                out.extend(step_blocks(node, size, max_width));
+            }
             "paragraph" => {
                 if !children(node).is_empty() {
                     out.push(Block::Para(inline_runs(node, size, max_width, Paragraph::new())));
@@ -344,5 +349,30 @@ mod tests {
         );
         assert!(a < b && b < c && c < d);
         assert!(xml.contains("Scrap rose"), "step text is present");
+    }
+
+    #[test]
+    fn story_and_all_supporting_blocks_survive_docx_export() {
+        let mut data = sample();
+        let mut details = data.steps[0].content.clone();
+        crate::richtext::append_block(&mut details, serde_json::json!({"type": "table", "content": [
+            {"type": "tableRow", "content": [{"type": "tableCell", "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": "Supporting measurement"}]}
+            ]}]}
+        ]}));
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let src = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png.into_inner()));
+        crate::richtext::append_block(&mut details, serde_json::json!({"type": "image", "attrs": {"src": src}}));
+        data.steps[0].content = crate::richtext::story_document(&details, vec![
+            crate::richtext::narrative_paragraph("A concise account of the problem.", &[]),
+        ]);
+        for layout in [Layout::Quadrant, Layout::Accordion] {
+            let xml = document_xml(&render_docx(&data, &opts(layout)).unwrap());
+            assert!(xml.contains("At a glance") && xml.contains("A concise account of the problem."));
+            assert!(xml.contains("Supporting evidence and details") && xml.contains("Scrap rose"));
+            assert!(xml.contains("Supporting measurement") && xml.contains("w:drawing"));
+            assert!(!xml.contains("Nothing recorded yet."), "wrappers do not hide real content");
+        }
     }
 }

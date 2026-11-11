@@ -28,6 +28,8 @@ pub struct CompletionRequest {
     pub images: Vec<ImageData>,
     pub schema: Option<Value>,
     pub max_tokens: u32,
+    /// Bounded rewriting/checking: avoid expensive thinking where explicitly supported.
+    pub fast: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -176,7 +178,7 @@ impl AiProvider for Anthropic {
         };
         match v["stop_reason"].as_str() {
             Some("refusal") => return Err(CoreError::ai("The AI model declined this request.")),
-            Some("max_tokens") => return Err(CoreError::ai("The AI reply was too long and got cut off.")),
+            Some("max_tokens") => return Err(CoreError::new("AI_TRUNCATED", "The AI reply was too long and got cut off.")),
             _ => {}
         }
         let text = v["content"]
@@ -231,7 +233,7 @@ impl OpenAi {
             b.bearer_auth(&self.s.key)
         }
     }
-    async fn call(&self, req: &CompletionRequest, format: Option<Value>) -> Result<Value> {
+    fn body(&self, req: &CompletionRequest, format: Option<Value>) -> Value {
         let mut parts: Vec<Value> = req
             .images
             .iter()
@@ -244,9 +246,18 @@ impl OpenAi {
         });
         // OpenAI's newer models take max_completion_tokens. Compatible services mostly take max_tokens.
         body[if self.custom { "max_tokens" } else { "max_completion_tokens" }] = json!(req.max_tokens);
+        let deepseek = reqwest::Url::parse(self.base()).ok()
+            .is_some_and(|url| url.host_str() == Some("api.deepseek.com"));
+        if req.fast && self.custom && deepseek && matches!(self.s.model.as_str(), "deepseek-v4-pro" | "deepseek-flash") {
+            body["thinking"] = json!({"type": "disabled"});
+        }
         if let Some(f) = format {
             body["response_format"] = f;
         }
+        body
+    }
+    async fn call(&self, req: &CompletionRequest, format: Option<Value>) -> Result<Value> {
+        let body = self.body(req, format);
         let url = format!("{}/chat/completions", self.base());
         let resp = send(|| self.auth(self.s.client.post(&url)).json(&body)).await?;
         Ok(resp.json().await?)
@@ -278,7 +289,7 @@ impl AiProvider for OpenAi {
         };
         let choice = &v["choices"][0];
         match choice["finish_reason"].as_str() {
-            Some("length") => return Err(CoreError::ai("The AI reply was too long and got cut off.")),
+            Some("length") => return Err(CoreError::new("AI_TRUNCATED", "The AI reply was too long and got cut off.")),
             Some("content_filter") => return Err(CoreError::ai("The AI model declined this request.")),
             _ => {}
         }
@@ -340,7 +351,7 @@ impl AiProvider for Google {
         let v: Value = resp.json().await?;
         let cand = &v["candidates"][0];
         match cand["finishReason"].as_str() {
-            Some("MAX_TOKENS") => return Err(CoreError::ai("The AI reply was too long and got cut off.")),
+            Some("MAX_TOKENS") => return Err(CoreError::new("AI_TRUNCATED", "The AI reply was too long and got cut off.")),
             Some("SAFETY") | Some("RECITATION") | Some("PROHIBITED_CONTENT") => {
                 return Err(CoreError::ai("The AI model declined this request."))
             }
@@ -406,5 +417,23 @@ mod tests {
     fn custom_needs_an_address() {
         let cfg = AiConfig { provider: "custom".into(), model: "m".into(), ..Default::default() };
         assert!(make_provider(&cfg, "k").is_err());
+    }
+
+    #[test]
+    fn fast_editing_only_disables_thinking_on_supported_official_deepseek_requests() {
+        for (base, model, fast, expected) in [
+            ("https://api.deepseek.com/v1", "deepseek-v4-pro", true, true),
+            ("https://api.deepseek.com", "deepseek-flash", true, true),
+            ("https://api.deepseek.com/v1", "deepseek-v4-pro", false, false),
+            ("https://proxy.example.com/v1", "deepseek-v4-pro", true, false),
+            ("https://api.deepseek.com.example.com/v1", "deepseek-v4-pro", true, false),
+            ("https://api.deepseek.com/v1", "another-model", true, false),
+        ] {
+            let provider = OpenAi { s: Shared { client: Client::new(), key: String::new(), model: model.into(), base: Some(base.into()) }, custom: true };
+            let body = provider.body(&CompletionRequest { fast, max_tokens: 4096, ..Default::default() }, None);
+            assert_eq!(body.get("thinking").is_some(), expected, "{base} {model} fast={fast}");
+            if expected { assert_eq!(body["thinking"]["type"], "disabled"); }
+            assert_eq!(body["max_tokens"], 4096);
+        }
     }
 }

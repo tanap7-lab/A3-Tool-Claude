@@ -8,8 +8,23 @@ export type DiffPart = { kind: 'same' | 'del' | 'add'; text: string };
 
 /** Word-level diff for "struck-out and added words" (section 9.4). */
 export function wordDiff(before: string, after: string): DiffPart[] {
+  if (before === after) return before ? [{ kind: 'same', text: before }] : [];
   const a = before.split(/(\s+)/);
   const b = after.split(/(\s+)/);
+  // Whole-section previews must not allocate an unbounded quadratic LCS matrix.
+  if (a.length * b.length > 1_000_000) {
+    let start = 0;
+    while (start < a.length && start < b.length && a[start] === b[start]) start++;
+    let end = 0;
+    while (end < a.length - start && end < b.length - start && a[a.length - end - 1] === b[b.length - end - 1]) end++;
+    const parts: DiffPart[] = [
+      { kind: 'same', text: a.slice(0, start).join('') },
+      { kind: 'del', text: a.slice(start, a.length - end).join('') },
+      { kind: 'add', text: b.slice(start, b.length - end).join('') },
+      { kind: 'same', text: a.slice(a.length - end).join('') },
+    ];
+    return parts.filter((p) => p.text);
+  }
   const lcs: number[][] = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0));
   for (let i = a.length - 1; i >= 0; i--) {
     for (let j = b.length - 1; j >= 0; j--) {
