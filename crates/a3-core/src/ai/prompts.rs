@@ -198,7 +198,8 @@ what_happened: at most 40 words.
 who_should_check: choose only from the allowed areas and products given. May be empty.
 quick_check: at most 2 lines, using only checks or conditions stated in the A3. If the A3 states no check to run, set it to null.
 quick_check_source and quick_check_quote: cite where the A3 states that check, or null when quick_check is null.
-source and quote: cite what supports what_happened."
+source and quote: cite what supports what_happened.
+Keep every field short. Do not explain your reasoning. Output the JSON object and nothing else."
     )
 }
 
@@ -221,9 +222,47 @@ pub fn verify_schema() -> Value {
     object(&[("adds_claim_ids", array(string()))])
 }
 
-pub fn ask_system(words: usize) -> String {
+/// Where an Ask answer may draw from. `A3Only` is the closed world of G1. The others add a clearly
+/// separated background part, so outside knowledge never passes for something the A3 says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskKnowledge {
+    #[default]
+    A3Only,
+    General,
+    Web,
+}
+
+impl AskKnowledge {
+    pub fn is_open(self) -> bool {
+        self != Self::A3Only
+    }
+}
+
+/// The closed-world rule in BASE, which the open Ask job swaps for the rule below it.
+const CLOSED_WORLD: &str = "Use only the content supplied in this message. Do not use outside engineering knowledge, typical causes or assumptions. If the content does not say something, you do not know it.";
+const OPEN_WORLD: &str = "The content supplied in this message is the only evidence about this A3. Every statement about what this A3 says, its numbers, causes or actions must come from it and be cited. Outside knowledge is allowed only in the field the job names for it, and never as a statement about this A3. Do not assume typical causes for this A3's problem.";
+
+/// How the assistant behaves across a conversation. Memory only helps if the answers move forward.
+const CONVERSATION: &str = "Earlier turns, when present, are in <ask_history>. Use them to resolve words like 'it' or 'that' and to build on what was already said. Do not repeat an earlier answer. If the user asks something already answered, or asks again because the answer did not land, explain it from a new angle: different words and structure, a concrete example, a simpler step-by-step, or an analogy. Never open two answers with the same sentence. When <repeat_question> is present, this is a re-ask, so follow it.";
+
+pub fn ask_system(words: usize, knowledge: AskKnowledge) -> String {
+    if !knowledge.is_open() {
+        return format!(
+            "{BASE}\n\nJob: answer the user's question about this A3 in at most {words} words, using only its content. Cite every source you used. If the content does not answer the question, say so plainly and return no sources. Do not speculate.\n{CONVERSATION}"
+        );
+    }
+    let base = BASE.replacen(CLOSED_WORLD, OPEN_WORLD, 1);
+    let background = if knowledge == AskKnowledge::Web {
+        "Search the web when it would help, prefer reputable sources, and write what you found in your own words."
+    } else {
+        "Use your own knowledge. Do not search."
+    };
     format!(
-        "{BASE}\n\nJob: answer the user's question about this A3 in at most {words} words, using only its content. Cite every source you used. If the content does not answer the question, say so plainly and return no sources. Do not speculate."
+        "{base}\n\nJob: answer the user's question about this A3 in at most {words} words in total, in two separate fields.
+answer: only what this A3 itself says that bears on the question, using only its content. Cite every source you used. Leave it empty if the A3 says nothing relevant.
+background: general knowledge that helps the user understand the question, such as what a term means or how a method works. {background} State plainly when you are unsure. Never present background as something this A3 states, never use it to say what happened in this A3, and keep A3 facts out of it. Leave it empty when no background is needed.
+{CONVERSATION}"
     )
 }
 
@@ -231,6 +270,14 @@ pub fn ask_schema() -> Value {
     object(&[
         ("answer", string()),
         ("sources", array(object(&[("id", string()), ("quote", string())]))),
+    ])
+}
+
+pub fn ask_open_schema() -> Value {
+    object(&[
+        ("answer", string()),
+        ("sources", array(object(&[("id", string()), ("quote", string())]))),
+        ("background", string()),
     ])
 }
 
@@ -254,4 +301,32 @@ pub const VISION_SYSTEM: &str = "Read the text in this image exactly as written,
 
 pub fn vision_schema() -> Value {
     object(&[("text", string())])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closed_world_swap_really_happens() {
+        assert!(BASE.contains(CLOSED_WORLD), "BASE changed, so the open Ask prompt would keep the closed-world rule");
+        let open = ask_system(60, AskKnowledge::General);
+        assert!(!open.contains("Do not use outside engineering knowledge"));
+        assert!(open.contains("background"));
+        assert!(ask_system(60, AskKnowledge::A3Only).contains("Do not use outside engineering knowledge"));
+    }
+
+    #[test]
+    fn only_web_mode_tells_the_model_to_search() {
+        assert!(ask_system(60, AskKnowledge::Web).contains("Search the web"));
+        assert!(ask_system(60, AskKnowledge::General).contains("Do not search"));
+    }
+
+    #[test]
+    fn every_ask_prompt_asks_for_fresh_explanations() {
+        for k in [AskKnowledge::A3Only, AskKnowledge::General, AskKnowledge::Web] {
+            assert!(ask_system(60, k).contains("Do not repeat an earlier answer"));
+            assert!(ask_system(60, k).contains("answer the user's question about this A3"), "the e2e mock model keys on this phrase");
+        }
+    }
 }

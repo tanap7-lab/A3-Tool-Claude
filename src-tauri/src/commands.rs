@@ -400,6 +400,17 @@ async fn fetch_to_temp(session: &Session, a: &Attachment, sub: &str) -> Result<P
     Ok(path)
 }
 
+/// A page an Ask answer cites from the web, opened in the user's browser. Only web addresses are opened,
+/// so a link can never start a program or open a local file.
+#[tauri::command]
+pub fn open_web_link(app: AppHandle, url: String) -> Result<()> {
+    let ok = url.len() <= 2048 && (url.starts_with("https://") || url.starts_with("http://"));
+    if !ok {
+        return Err(CoreError::new("OPEN", "That is not a web address."));
+    }
+    app.opener().open_url(url, None::<&str>).map_err(|e| CoreError::new("OPEN", format!("Could not open the web page: {e}")))
+}
+
 /// FR-ATT-02: opened in its default app.
 #[tauri::command]
 pub async fn attachment_open(app: AppHandle, state: S<'_>, id: Uuid) -> Result<()> {
@@ -480,8 +491,8 @@ pub async fn ai_draft_warning(app: AppHandle, state: S<'_>, sheet: Uuid) -> Resu
     ai_service(&app, &state.session()?)?.draft_warning(sheet).await
 }
 #[tauri::command]
-pub async fn ai_ask(app: AppHandle, state: S<'_>, sheet: Uuid, question: String, more: bool) -> Result<AskAnswer> {
-    ai_service(&app, &state.session()?)?.ask(sheet, &question, more).await
+pub async fn ai_ask(app: AppHandle, state: S<'_>, sheet: Uuid, question: String, more: bool, options: Option<ai::AskOptions>) -> Result<AskAnswer> {
+    ai_service(&app, &state.session()?)?.ask_with(sheet, &question, more, &options.unwrap_or_default()).await
 }
 #[tauri::command]
 pub async fn ai_suggest_tasks(app: AppHandle, state: S<'_>, warning: Uuid) -> Result<Vec<String>> {

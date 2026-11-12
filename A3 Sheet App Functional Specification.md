@@ -308,7 +308,7 @@ AI does a small set of fixed jobs inside one A3, shows little by default, and ha
 | Phrasing | User clicks Improve on a step or selection | Inline before and after | 3 per step |
 | Early warning draft | User clicks Post warning | Pre-filled card | Field limits in section 10 |
 | Condense to fit | Quadrant overflows at export | Inline before and after | Only for the overflowing quadrant |
-| Ask | User types or picks a suggested question | Short answer with source chips | 60 words, then "Tell me more" |
+| Ask | User types or picks a suggested question | Short answer with source chips, plus a separate labelled background part if the user allowed it (9.7) | 60 words, then "Tell me more" |
 
 AI items never appear as pop-ups. There are no scores, confidence percentages or long explanations. Each item offers **Why?**, which reveals up to two sentences.
 
@@ -324,7 +324,7 @@ The AI's memory belongs to the A3, not to a chat or a user. It is rebuilt from t
 | Source index | One-paragraph summary of each attachment | Always |
 | Source passages | The passages most relevant to this job, found by PostgreSQL full-text search | Up to the token budget |
 | Linked warnings | Warnings posted from this A3 and their check results | Always |
-| Ask history | Last 6 exchanges plus a rolling summary | Ask only |
+| Ask history | Last 6 exchanges plus a rolling summary | Ask only, and only while the user keeps "Remember this conversation" on (9.7) |
 
 The sheet state is never cut. If passages exceed the model's budget, the least relevant are dropped and the item states "based on 40 of 62 pages".
 
@@ -380,7 +380,7 @@ The model is told to stay grounded, and the app then verifies that it did.
 
 | ID | Guardrail | Enforced by |
 | --- | --- | --- |
-| G1 | Closed world: use only the supplied A3 context. No outside engineering knowledge or typical causes | Prompt |
+| G1 | Closed world: use only the supplied A3 context. No outside engineering knowledge or typical causes. The one exception is Ask when the user widens it (9.7), and then outside knowledge is confined to its own labelled field | Prompt |
 | G2 | Structured JSON output only. Invalid output gets one retry, then a visible failure | Rust |
 | G3 | Every item cites a source passage or step sentence by ID. Unknown IDs are discarded | Rust |
 | G4 | Each cited quote must actually be in that passage, ignoring spacing and case. If not, the item is discarded | Rust |
@@ -393,6 +393,26 @@ The model is told to stay grounded, and the app then verifies that it did.
 Discarded items are logged for quality tracking and not shown. Text read from images is less certain, so its cards say "read from image, check the numbers".
 
 Every AI call records job, model, sources used, outcome and token count. A job that fails shows one plain message with Retry, and never partial or unchecked content.
+
+### 9.7 Ask: sources and memory
+
+Ask is the one job where the user may choose how closed the AI's world is, and whether it remembers. Both choices belong to the person and are kept on their own computer, not on the A3.
+
+| Choice | Options | Default |
+| --- | --- | --- |
+| Where answers come from | **This A3** only, **+ General** (the model's own knowledge), **+ Web** (the provider's web search, offered only where the provider has one) | This A3 |
+| Memory | **Remember this conversation** on or off, and **Start fresh** | On |
+
+| Rule | Detail |
+| --- | --- |
+| Two parts, never mixed | With General or Web, the model returns the part about this A3 and a separate background part. The A3 part keeps G3 to G5 in full. The background part is outside knowledge, so G3 to G5 cannot apply to it. It is shown in its own box, labelled "General knowledge" or "Web search" and "not from this A3" |
+| Background is not evidence | Earlier background in the history is not counted as support for a later statement about the A3 (G5) |
+| Web pages are real | Links come from the provider's search results, never from model text. If no search ran, the label says General knowledge and no links show |
+| No fresh traced answer, no A3 claim | If the A3 part fails its checks, it is dropped. The background part can still show, with "This A3 does not say anything about that." |
+| Memory off | No earlier turn is sent to the AI. The turn is still recorded in the ask history |
+| Start fresh | Turns up to that moment are hidden and no longer sent. Nothing is deleted |
+| Repeated questions | A question the user has asked before is answered from a new angle, in different words, rather than repeated. "Tell me more" adds detail instead of restating |
+| Web privacy | The AI writes the search terms and they may include details from the A3. The panel says so before the user turns Web on |
 
 ## 10. Early warning wall
 

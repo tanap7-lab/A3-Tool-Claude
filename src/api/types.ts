@@ -354,6 +354,21 @@ export interface CitedSource {
   segmentId: string | null;
   label: string;
   quote: string;
+  /** `a3` (or missing, on older messages) cites this A3. `background` is outside knowledge and its text is
+   * in `quote`. `web` is a page the search returned, at `url`. */
+  kind?: 'a3' | 'background' | 'web';
+  url?: string | null;
+}
+
+/** Where an Ask answer may draw from. */
+export type AskKnowledge = 'a3_only' | 'general' | 'web';
+
+export interface AskOptions {
+  knowledge: AskKnowledge;
+  /** Send earlier turns to the AI. Off means every question stands alone. */
+  memory: boolean;
+  /** Ignore turns up to and including this moment (the user started fresh). */
+  since: string | null;
 }
 
 export interface AskAnswer {

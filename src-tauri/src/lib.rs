@@ -156,6 +156,7 @@ pub fn run() {
             commands::ai_condense,
             commands::ai_draft_warning,
             commands::ai_ask,
+            commands::open_web_link,
             commands::ai_suggest_tasks,
             commands::ai_settings_get,
             commands::ai_settings_save,

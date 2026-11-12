@@ -30,6 +30,17 @@ pub struct CompletionRequest {
     pub max_tokens: u32,
     /// Bounded rewriting/checking: avoid expensive thinking where explicitly supported.
     pub fast: bool,
+    /// Let the model search the web for this request. Only providers whose `supports_web` is true honour it.
+    pub web: bool,
+}
+
+/// A page the provider's own search tool returned. These come from the provider, never from model text,
+/// so a link shown to the user is one that was really retrieved.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WebSource {
+    pub title: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -37,12 +48,17 @@ pub struct Completion {
     pub text: String,
     pub input_tokens: i32,
     pub output_tokens: i32,
+    pub web_sources: Vec<WebSource>,
 }
 
 #[async_trait]
 pub trait AiProvider: Send + Sync {
     fn name(&self) -> &str;
     fn model(&self) -> &str;
+    /// Whether this provider has a built-in web search tool the app can switch on.
+    fn supports_web(&self) -> bool {
+        false
+    }
     async fn complete(&self, req: &CompletionRequest) -> Result<Completion>;
     async fn list_models(&self) -> Result<Vec<String>>;
 }
@@ -141,24 +157,47 @@ impl Anthropic {
     fn auth(&self, b: RequestBuilder) -> RequestBuilder {
         b.header("x-api-key", &self.0.key).header("anthropic-version", "2026-10-21")
     }
-    async fn call(&self, req: &CompletionRequest, use_format: bool) -> Result<Value> {
+    /// `resumed` holds the assistant turn of a search the server paused, so the same request can carry on.
+    async fn call(&self, req: &CompletionRequest, use_format: bool, resumed: &[Value]) -> Result<Value> {
         let mut content: Vec<Value> = req
             .images
             .iter()
             .map(|i| json!({"type": "image", "source": {"type": "base64", "media_type": i.mime, "data": i.base64}}))
             .collect();
         content.push(json!({"type": "text", "text": req.user}));
+        let mut messages = vec![json!({"role": "user", "content": content})];
+        messages.extend(resumed.iter().cloned());
         let mut body = json!({
             "model": self.0.model,
             "max_tokens": req.max_tokens,
             "system": req.system,
-            "messages": [{"role": "user", "content": content}],
+            "messages": messages,
         });
         if let (true, Some(schema)) = (use_format, &req.schema) {
             body["output_config"] = json!({"format": {"type": "json_schema", "schema": schema}});
         }
+        if req.web {
+            // The basic variant works on every model the app can be pointed at.
+            body["tools"] = json!([{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]);
+        }
         let resp = send(|| self.auth(self.0.client.post(self.url("/v1/messages"))).json(&body)).await?;
         Ok(resp.json().await?)
+    }
+}
+
+/// Pages the search tool returned. A failed search comes back as an error object instead of a list, and is skipped.
+fn web_sources_in(reply: &Value, into: &mut Vec<WebSource>) {
+    for block in reply["content"].as_array().into_iter().flatten() {
+        if block["type"] != "web_search_tool_result" {
+            continue;
+        }
+        for hit in block["content"].as_array().into_iter().flatten() {
+            let (Some(url), title) = (hit["url"].as_str(), hit["title"].as_str().unwrap_or("")) else { continue };
+            let safe = url.starts_with("https://") || url.starts_with("http://");
+            if safe && !into.iter().any(|s| s.url == url) {
+                into.push(WebSource { title: if title.is_empty() { url.to_string() } else { title.to_string() }, url: url.to_string() });
+            }
+        }
     }
 }
 
@@ -170,28 +209,40 @@ impl AiProvider for Anthropic {
     fn model(&self) -> &str {
         &self.0.model
     }
+    fn supports_web(&self) -> bool {
+        true
+    }
     async fn complete(&self, req: &CompletionRequest) -> Result<Completion> {
-        // Older models lack structured outputs. Falling back is safe, because G2 validates every reply.
-        let v = match self.call(req, true).await {
-            Err(e) if e.code == "AI_BAD_REQUEST" && req.schema.is_some() => self.call(&with_schema_in_prompt(req), false).await?,
-            other => other?,
-        };
-        match v["stop_reason"].as_str() {
-            Some("refusal") => return Err(CoreError::ai("The AI model declined this request.")),
-            Some("max_tokens") => return Err(CoreError::new("AI_TRUNCATED", "The AI reply was too long and got cut off.")),
-            _ => {}
+        let mut out = Completion::default();
+        let mut resumed: Vec<Value> = Vec::new();
+        // A long web search can pause the turn. Resume it a few times, then give up.
+        for _ in 0..4 {
+            // Older models lack structured outputs. Falling back is safe, because G2 validates every reply.
+            let v = match self.call(req, true, &resumed).await {
+                Err(e) if e.code == "AI_BAD_REQUEST" && req.schema.is_some() => self.call(&with_schema_in_prompt(req), false, &resumed).await?,
+                other => other?,
+            };
+            match v["stop_reason"].as_str() {
+                Some("refusal") => return Err(CoreError::ai("The AI model declined this request.")),
+                Some("max_tokens") => return Err(CoreError::new("AI_TRUNCATED", "The AI reply was too long and got cut off.")),
+                _ => {}
+            }
+            out.input_tokens += v["usage"]["input_tokens"].as_i64().unwrap_or(0) as i32;
+            out.output_tokens += v["usage"]["output_tokens"].as_i64().unwrap_or(0) as i32;
+            web_sources_in(&v, &mut out.web_sources);
+            out.text = v["content"]
+                .as_array()
+                .map(|blocks| {
+                    blocks.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("")
+                })
+                .unwrap_or_default();
+            if v["stop_reason"].as_str() == Some("pause_turn") && req.web {
+                resumed = vec![json!({"role": "assistant", "content": v["content"]})];
+                continue;
+            }
+            return Ok(out);
         }
-        let text = v["content"]
-            .as_array()
-            .map(|blocks| {
-                blocks.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("")
-            })
-            .unwrap_or_default();
-        Ok(Completion {
-            text,
-            input_tokens: v["usage"]["input_tokens"].as_i64().unwrap_or(0) as i32,
-            output_tokens: v["usage"]["output_tokens"].as_i64().unwrap_or(0) as i32,
-        })
+        Err(CoreError::ai("The web search took too long. Try again, or ask without the web."))
     }
     async fn list_models(&self) -> Result<Vec<String>> {
         let mut out = Vec::new();
@@ -302,6 +353,7 @@ impl AiProvider for OpenAi {
             text: choice["message"]["content"].as_str().unwrap_or("").to_string(),
             input_tokens: v["usage"]["prompt_tokens"].as_i64().unwrap_or(0) as i32,
             output_tokens: v["usage"]["completion_tokens"].as_i64().unwrap_or(0) as i32,
+            ..Default::default()
         })
     }
     async fn list_models(&self) -> Result<Vec<String>> {
@@ -365,6 +417,7 @@ impl AiProvider for Google {
             text,
             input_tokens: v["usageMetadata"]["promptTokenCount"].as_i64().unwrap_or(0) as i32,
             output_tokens: v["usageMetadata"]["candidatesTokenCount"].as_i64().unwrap_or(0) as i32,
+            ..Default::default()
         })
     }
     async fn list_models(&self) -> Result<Vec<String>> {
@@ -405,6 +458,33 @@ mod tests {
         assert!(check_base_url("https://llm.example.com/v1").is_ok());
         assert!(check_base_url("http://localhost:8080/v1").is_ok());
         assert!(check_base_url("http://llm.example.com/v1").is_err());
+    }
+
+    #[test]
+    fn web_sources_come_only_from_search_results() {
+        let reply = json!({"content": [
+            {"type": "text", "text": "{\"answer\":\"\"}"},
+            {"type": "web_search_tool_result", "content": [
+                {"type": "web_search_result", "url": "https://example.com/a", "title": "A page"},
+                {"type": "web_search_result", "url": "https://example.com/a", "title": "Duplicate"},
+                {"type": "web_search_result", "url": "javascript:alert(1)", "title": "Not a web page"},
+                {"type": "web_search_result", "url": "https://example.com/b", "title": ""}
+            ]},
+            {"type": "web_search_tool_result", "content": {"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}}
+        ]});
+        let mut got = Vec::new();
+        web_sources_in(&reply, &mut got);
+        assert_eq!(got.len(), 2, "duplicates, non-web links and failed searches are skipped");
+        assert_eq!(got[0].title, "A page");
+        assert_eq!(got[1].title, "https://example.com/b", "a missing title falls back to the address");
+    }
+
+    #[test]
+    fn only_anthropic_offers_web_search() {
+        for (provider, expected) in [("anthropic", true), ("openai", false), ("google", false)] {
+            let cfg = AiConfig { provider: provider.into(), model: "m".into(), ..Default::default() };
+            assert_eq!(make_provider(&cfg, "k").unwrap().supports_web(), expected, "{provider}");
+        }
     }
 
     #[test]

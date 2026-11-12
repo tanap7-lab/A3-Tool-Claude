@@ -107,6 +107,8 @@ pub async fn add_text_file(repo: Arc<PgRepository>, sheet: Uuid, name: &str, tex
 pub struct MockProvider {
     pub replies: Mutex<VecDeque<String>>,
     pub seen: Mutex<Vec<CompletionRequest>>,
+    /// Pages a search would have returned, handed back with every reply.
+    pub web_sources: Vec<a3_core::ai::WebSource>,
 }
 
 impl MockProvider {
@@ -114,10 +116,18 @@ impl MockProvider {
         Arc::new(Self {
             replies: Mutex::new(replies.into_iter().map(|v| v.to_string()).collect()),
             seen: Mutex::new(Vec::new()),
+            web_sources: Vec::new(),
+        })
+    }
+    pub fn with_web(replies: Vec<Value>, web_sources: Vec<a3_core::ai::WebSource>) -> Arc<Self> {
+        Arc::new(Self {
+            replies: Mutex::new(replies.into_iter().map(|v| v.to_string()).collect()),
+            seen: Mutex::new(Vec::new()),
+            web_sources,
         })
     }
     pub fn raw(replies: Vec<&str>) -> Arc<Self> {
-        Arc::new(Self { replies: Mutex::new(replies.into_iter().map(str::to_string).collect()), seen: Mutex::new(Vec::new()) })
+        Arc::new(Self { replies: Mutex::new(replies.into_iter().map(str::to_string).collect()), seen: Mutex::new(Vec::new()), web_sources: Vec::new() })
     }
     pub fn requests(&self) -> Vec<CompletionRequest> {
         self.seen.lock().unwrap().clone()
@@ -140,7 +150,10 @@ impl AiProvider for MockProvider {
             .unwrap()
             .pop_front()
             .ok_or_else(|| a3_core::CoreError::ai("mock ran out of replies"))?;
-        Ok(Completion { text, input_tokens: 10, output_tokens: 5 })
+        Ok(Completion { text, input_tokens: 10, output_tokens: 5, web_sources: self.web_sources.clone() })
+    }
+    fn supports_web(&self) -> bool {
+        true
     }
     async fn list_models(&self) -> Result<Vec<String>> {
         Ok(vec!["mock-1".into()])

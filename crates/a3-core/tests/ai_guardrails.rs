@@ -809,6 +809,49 @@ async fn a_warning_draft_while_b_is_open_names_no_cause() {
 }
 
 #[tokio::test]
+async fn a_truncated_warning_draft_retries_with_more_space_instead_of_failing() {
+    use a3_core::ai::{AiProvider, Completion, CompletionRequest};
+    use std::sync::{Mutex, atomic::{AtomicBool, Ordering}};
+    struct TruncateFirstDraft {
+        inner: Arc<MockProvider>,
+        truncated: AtomicBool,
+        budgets: Mutex<Vec<u32>>,
+    }
+    #[async_trait::async_trait]
+    impl AiProvider for TruncateFirstDraft {
+        fn name(&self) -> &str { "mock" }
+        fn model(&self) -> &str { "mock" }
+        async fn complete(&self, req: &CompletionRequest) -> a3_core::Result<Completion> {
+            self.budgets.lock().unwrap().push(req.max_tokens);
+            if !self.truncated.swap(true, Ordering::SeqCst) {
+                return Err(a3_core::CoreError::new("AI_TRUNCATED", "Reply cut off."));
+            }
+            self.inner.complete(req).await
+        }
+        async fn list_models(&self) -> a3_core::Result<Vec<String>> { Ok(vec![]) }
+    }
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    let id = d.sheet.id;
+    fill_step(&t.owner, id, "A", "Line 4 scrapped 3.5% of PN-4471.").await;
+    let mock = MockProvider::new(vec![
+        json!({
+            "headline": "Line 4 scrap", "what_happened": "Line 4 scrapped 3.5% of PN-4471.", "who_should_check": [],
+            "quick_check": null, "quick_check_source": null, "quick_check_quote": null,
+            "source": "A.1", "quote": "scrapped 3.5%"
+        }),
+        json!({"adds_claim_ids": []}),
+    ]);
+    let provider = Arc::new(TruncateFirstDraft { inner: mock.clone(), truncated: AtomicBool::new(false), budgets: Mutex::new(vec![]) });
+    let draft = a3_core::ai::AiService::new(t.owner.clone(), provider.clone()).draft_warning(id).await.unwrap();
+    assert_eq!(draft.headline, "Line 4 scrap");
+    let budgets = provider.budgets.lock().unwrap().clone();
+    assert!(budgets[0] >= 4096, "the draft starts with room for thinking, got {}", budgets[0]);
+    assert_eq!(budgets[1], budgets[0] * 2, "the retry doubles the budget");
+    assert!(mock.requests().iter().all(|r| r.fast), "both draft calls skip expensive thinking");
+}
+
+#[tokio::test]
 async fn quick_check_stays_blank_when_the_a3_states_no_check() {
     let t = team().await;
     let d = new_sheet(&t.owner, t.project.id).await;
@@ -854,6 +897,155 @@ async fn ask_answers_only_with_traced_sources() {
     service(t.outsider.clone(), mock.clone()).ask(id, "Again?", false).await.unwrap();
     assert!(mock.requests()[0].user.contains("What is the target?"), "history is in the prompt for a different user");
     assert_eq!(t.outsider.messages(id).await.unwrap().iter().filter(|m| m.role == "user").count(), 4);
+}
+
+fn open(knowledge: a3_core::ai::AskKnowledge) -> a3_core::ai::AskOptions {
+    a3_core::ai::AskOptions { knowledge, ..Default::default() }
+}
+
+fn stored_background(m: &AiMessage) -> Option<String> {
+    m.sources.as_array()?.iter().find(|s| s["kind"] == "background").and_then(|s| s["quote"].as_str()).map(str::to_string)
+}
+
+#[tokio::test]
+async fn ask_with_general_knowledge_keeps_it_apart_from_the_a3() {
+    use a3_core::ai::AskKnowledge::{A3Only, General};
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    let id = d.sheet.id;
+    fill_step(&t.owner, id, "A", "Scrap was 3.5% against a 1.0% target.").await;
+    let both = json!({
+        "answer": "The target is 1.0%.", "sources": [{"id": "A.1", "quote": "1.0% target"}],
+        "background": "Scrap rate is the share of parts thrown away. Many plants review it every shift, often against a goal below 2%."
+    });
+
+    // The model may use outside knowledge, but only in its own labelled field.
+    let mock = MockProvider::new(vec![both.clone()]);
+    let a = service(t.owner.clone(), mock.clone()).ask_with(id, "What is scrap rate?", false, &open(General)).await.unwrap();
+    assert_eq!(a.text, "The target is 1.0%.");
+    assert_eq!(a.sources.len(), 1);
+    let req = &mock.requests()[0];
+    assert!(!req.system.contains("Do not use outside engineering knowledge"), "the closed-world rule is lifted");
+    assert!(req.system.contains("Never present background as something this A3 states"));
+    assert!(!req.web, "general knowledge never searches");
+    let last = t.owner.messages(id).await.unwrap().into_iter().rfind(|m| m.role == "assistant").unwrap();
+    assert!(stored_background(&last).unwrap().starts_with("Scrap rate is"));
+    assert_eq!(last.text, "The target is 1.0%.", "the A3 part and the background are stored separately");
+    assert_eq!(last.sources.as_array().unwrap().iter().find(|s| s["kind"] == "background").unwrap()["label"], "General knowledge");
+
+    // This A3 only stays closed: a background the model volunteers is dropped, never shown.
+    let a = service(t.owner.clone(), MockProvider::new(vec![both.clone()])).ask_with(id, "What is scrap rate?", false, &open(A3Only)).await.unwrap();
+    assert_eq!(a.text, "The target is 1.0%.");
+    let last = t.owner.messages(id).await.unwrap().into_iter().rfind(|m| m.role == "assistant").unwrap();
+    assert!(stored_background(&last).is_none());
+
+    // An A3 claim that fails G5 is dropped, while the labelled background survives and says so plainly.
+    let fake = json!({
+        "answer": "The target is 2.0%.", "sources": [{"id": "A.1", "quote": "1.0% target"}],
+        "background": "Scrap rate is the share of parts thrown away."
+    });
+    let a = service(t.owner.clone(), MockProvider::new(vec![fake])).ask_with(id, "What is scrap rate?", false, &open(General)).await.unwrap();
+    assert_eq!(a.text, "This A3 does not say anything about that.");
+    assert!(a.sources.is_empty());
+    let last = t.owner.messages(id).await.unwrap().into_iter().rfind(|m| m.role == "assistant").unwrap();
+    assert!(stored_background(&last).is_some());
+
+    // Nothing from the A3 and no background: the plain refusal.
+    let none = json!({"answer": "", "sources": [], "background": ""});
+    let a = service(t.owner.clone(), MockProvider::new(vec![none])).ask_with(id, "What is scrap rate?", false, &open(General)).await.unwrap();
+    assert_eq!(a.text, "I can't find that in this A3's content.");
+    assert!(!a.has_more);
+}
+
+#[tokio::test]
+async fn earlier_background_never_counts_as_evidence_about_the_a3() {
+    use a3_core::ai::AskKnowledge::General;
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    let id = d.sheet.id;
+    fill_step(&t.owner, id, "A", "Scrap was 3.5% against a 1.0% target.").await;
+    let first = json!({"answer": "", "sources": [], "background": "Many plants follow Kaizen events and a 7.5% yield rule."});
+    service(t.owner.clone(), MockProvider::new(vec![first])).ask_with(id, "What is Kaizen?", false, &open(General)).await.unwrap();
+
+    // The model now states outside facts as if the A3 said them. History holds them, but G5 must still catch it.
+    let leak = json!({"answer": "The target is 1.0% and Kaizen applies at 7.5%.", "sources": [{"id": "A.1", "quote": "1.0% target"}], "background": ""});
+    let mock = MockProvider::new(vec![leak]);
+    let a = service(t.owner.clone(), mock.clone()).ask_with(id, "What is the target?", false, &open(General)).await.unwrap();
+    assert!(mock.requests()[0].user.contains("Kaizen"), "the model does see its earlier background");
+    assert_eq!(a.text, "I can't find that in this A3's content.", "Kaizen and 7.5% came from outside the A3");
+}
+
+#[tokio::test]
+async fn ask_with_the_web_uses_only_pages_the_search_returned() {
+    use a3_core::ai::AskKnowledge::Web;
+    use a3_core::ai::WebSource;
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    let id = d.sheet.id;
+    fill_step(&t.owner, id, "A", "Scrap was 3.5% against a 1.0% target.").await;
+    let reply = json!({"answer": "", "sources": [], "background": "Scrap is material removed or rejected during production."});
+
+    let pages = vec![WebSource { title: "Scrap in manufacturing".into(), url: "https://example.com/scrap".into() }];
+    let mock = MockProvider::with_web(vec![reply.clone()], pages);
+    service(t.owner.clone(), mock.clone()).ask_with(id, "What is scrap?", false, &open(Web)).await.unwrap();
+    assert!(mock.requests()[0].web, "the provider is asked to search");
+    let last = t.owner.messages(id).await.unwrap().into_iter().rfind(|m| m.role == "assistant").unwrap();
+    let list = last.sources.as_array().unwrap();
+    assert_eq!(list.iter().find(|s| s["kind"] == "background").unwrap()["label"], "Web search");
+    let web = list.iter().find(|s| s["kind"] == "web").unwrap();
+    assert_eq!(web["url"], "https://example.com/scrap");
+
+    // If no search actually ran, the answer is labelled general knowledge, not Web search, and links nothing.
+    service(t.owner.clone(), MockProvider::new(vec![reply])).ask_with(id, "What is scrap?", false, &open(Web)).await.unwrap();
+    let last = t.owner.messages(id).await.unwrap().into_iter().rfind(|m| m.role == "assistant").unwrap();
+    let list = last.sources.as_array().unwrap();
+    assert_eq!(list.iter().find(|s| s["kind"] == "background").unwrap()["label"], "General knowledge");
+    assert!(list.iter().all(|s| s["kind"] != "web"));
+}
+
+#[tokio::test]
+async fn memory_is_the_users_choice_and_a_repeat_gets_a_new_explanation() {
+    use a3_core::ai::AskOptions;
+    let t = team().await;
+    let d = new_sheet(&t.owner, t.project.id).await;
+    let id = d.sheet.id;
+    fill_step(&t.owner, id, "A", "Scrap was 3.5% against a 1.0% target.").await;
+    let ok = json!({"answer": "The target is 1.0%.", "sources": [{"id": "A.1", "quote": "1.0% target"}]});
+
+    let mock = MockProvider::new(vec![ok.clone()]);
+    service(t.owner.clone(), mock.clone()).ask(id, "What is the target?", false).await.unwrap();
+    assert!(!mock.requests()[0].user.contains("<repeat_question>"), "a first question is not a repeat");
+
+    // The same question again, in other words and punctuation, steers the model away from repeating itself.
+    let mock = MockProvider::new(vec![ok.clone()]);
+    service(t.owner.clone(), mock.clone()).ask(id, "what is the TARGET", false).await.unwrap();
+    let user = &mock.requests()[0].user;
+    assert!(user.contains("<repeat_question>") && user.contains("Explain again from a different angle"));
+    assert!(user.contains("What is the target?"), "memory is on by default, so the earlier turn is sent");
+    assert!(mock.requests()[0].system.contains("Do not repeat an earlier answer"));
+
+    // Tell me more is a re-ask that must add detail instead.
+    let mock = MockProvider::new(vec![ok.clone()]);
+    service(t.owner.clone(), mock.clone()).ask(id, "What is the target?", true).await.unwrap();
+    assert!(mock.requests()[0].user.contains("wants more on a question already answered"));
+
+    // Memory off: nothing earlier is sent and nothing counts as a repeat, but the turn is still recorded.
+    let before = t.owner.messages(id).await.unwrap().len();
+    let mock = MockProvider::new(vec![ok.clone()]);
+    let off = AskOptions { memory: false, ..Default::default() };
+    service(t.owner.clone(), mock.clone()).ask_with(id, "What is the target?", false, &off).await.unwrap();
+    let user = &mock.requests()[0].user;
+    assert!(!user.contains("<ask_history>") && !user.contains("<repeat_question>"));
+    assert_eq!(t.owner.messages(id).await.unwrap().len(), before + 2);
+
+    // Starting fresh hides everything before that moment, even with memory on.
+    let since = Some(chrono::Utc::now());
+    let mock = MockProvider::new(vec![ok]);
+    let fresh = AskOptions { since, ..Default::default() };
+    service(t.owner.clone(), mock.clone()).ask_with(id, "What is the target?", false, &fresh).await.unwrap();
+    let user = &mock.requests()[0].user;
+    assert!(!user.contains("The target is 1.0%.\n</ask_history>") && !user.contains("user: What is the target?"));
+    assert!(!user.contains("<repeat_question>"));
 }
 
 #[tokio::test]

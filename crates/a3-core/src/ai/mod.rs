@@ -8,4 +8,5 @@ pub mod prompts;
 pub mod provider;
 
 pub use jobs::*;
-pub use provider::{make_provider, AiConfig, AiProvider, Completion, CompletionRequest};
+pub use prompts::AskKnowledge;
+pub use provider::{make_provider, AiConfig, AiProvider, Completion, CompletionRequest, WebSource};

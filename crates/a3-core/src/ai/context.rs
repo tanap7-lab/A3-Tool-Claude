@@ -22,8 +22,31 @@ pub struct ContextOptions {
     /// Leave step B text out. Used while B is open, so a warning draft has no cause to state.
     pub hide_open_cause: bool,
     pub ask_history: bool,
+    /// With `ask_history`, ignore turns from before this moment. The user chose to start fresh.
+    pub history_since: Option<Ts>,
     /// Summary requests already carry all step text in their document outline.
     pub omit_step_text: bool,
+}
+
+/// Marks a history line that holds outside knowledge. It always sits on one line, so a check that must
+/// accept only A3 evidence (G5) can drop these lines.
+pub const BACKGROUND_MARK: &str = "(background, not from the A3):";
+
+/// The context text with earlier background removed: what counts as evidence about this A3.
+pub fn evidence_text(ctx_text: &str) -> String {
+    ctx_text.lines().filter(|l| !l.contains(BACKGROUND_MARK)).collect::<Vec<_>>().join("\n")
+}
+
+/// The outside-knowledge part of a stored answer. It rides in the message's `sources` list as an item of
+/// kind `background`, so no schema change is needed.
+pub fn background_text(sources: &serde_json::Value) -> Option<String> {
+    sources
+        .as_array()?
+        .iter()
+        .find(|s| s["kind"] == "background")
+        .and_then(|s| s["quote"].as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
 }
 
 pub struct Citation {
@@ -186,7 +209,11 @@ pub async fn build(repo: &dyn Repository, sheet_id: Uuid, opts: &ContextOptions)
     let _ = writeln!(t, "</linked_warnings>");
 
     if opts.ask_history {
-        let messages = repo.messages(sheet_id).await?;
+        let mut messages = repo.messages(sheet_id).await?;
+        if let Some(since) = opts.history_since {
+            // The rolling summary is dated when it was written, so it is dropped with the turns it covers.
+            messages.retain(|m| m.created_at > since);
+        }
         let last_summary = messages.iter().rposition(|m| m.role == "summary");
         let _ = writeln!(t, "<ask_history>");
         if let Some(i) = last_summary {
@@ -199,6 +226,10 @@ pub async fn build(repo: &dyn Repository, sheet_id: Uuid, opts: &ContextOptions)
             .collect();
         for m in recent.iter().rev().take(12).rev() {
             let _ = writeln!(t, "{}: {}", m.role, fence(&m.text));
+            // What the assistant explained from outside the A3 is part of what was already said.
+            if let Some(b) = background_text(&m.sources) {
+                let _ = writeln!(t, "{} {BACKGROUND_MARK} {}", m.role, fence(&b).replace('\n', " "));
+            }
         }
         let _ = writeln!(t, "</ask_history>");
     }

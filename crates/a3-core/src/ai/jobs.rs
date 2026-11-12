@@ -4,8 +4,8 @@
 
 use super::context::{self, Context, ContextOptions};
 use super::guard;
-use super::prompts;
-use super::provider::{AiProvider, CompletionRequest};
+use super::prompts::{self, AskKnowledge};
+use super::provider::{AiProvider, CompletionRequest, WebSource};
 use crate::domain::{norm_key, normalize, sha256_hex, word_count};
 use crate::error::{CoreError, Result};
 use crate::extract::ImageData;
@@ -21,6 +21,9 @@ use uuid::Uuid;
 
 const MAX_TOKENS: u32 = 16_000;
 const SHORT_TOKENS: u32 = 2_000;
+/// The warning card itself is about 150 tokens of JSON, but reasoning models spend the same budget on thinking
+/// first. 2,000 was routinely used up before the JSON began, so the draft always came back cut off.
+const DRAFT_TOKENS: u32 = 4_096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -113,6 +116,35 @@ pub struct CitedSource {
     pub segment_id: Option<Uuid>,
     pub label: String,
     pub quote: String,
+    /// `a3` for a passage or step sentence, `background` for outside knowledge (its text is in `quote`),
+    /// `web` for a page the search tool returned (its address is in `url`). Stored with the message.
+    #[serde(default = "a3_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+fn a3_kind() -> String {
+    "a3".into()
+}
+
+/// What the user chose for one Ask. Both choices live in the app on the user's own machine and are sent
+/// with each question, so nothing about them is shared with colleagues.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AskOptions {
+    /// Where the answer may draw from. This A3 only, unless the user widens it.
+    pub knowledge: AskKnowledge,
+    /// Whether earlier turns are sent to the model. Off means every question stands alone.
+    pub memory: bool,
+    /// The user started fresh at this moment. Earlier turns are not sent.
+    pub since: Option<Ts>,
+}
+
+impl Default for AskOptions {
+    fn default() -> Self {
+        Self { knowledge: AskKnowledge::A3Only, memory: true, since: None }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +178,8 @@ struct RunLog {
     input_tokens: i32,
     output_tokens: i32,
     discards: Vec<String>,
+    /// Pages the provider's search tool returned during the job.
+    web_sources: Vec<WebSource>,
 }
 
 impl RunLog {
@@ -194,8 +228,9 @@ impl AiService {
         let mut req = req;
         for attempt in 0..2 {
             let c = match self.provider.complete(&req).await {
-                Err(e) if req.fast && e.code == "AI_TRUNCATED" && attempt == 0 && req.max_tokens < MAX_TOKENS => {
-                    log.discard("G2", "truncated bounded reply; retrying once with more output space");
+                // A cut-off reply is never usable, and the usual cause is thinking tokens eating the budget.
+                Err(e) if e.code == "AI_TRUNCATED" && attempt == 0 && req.max_tokens < MAX_TOKENS => {
+                    log.discard("G2", "truncated reply; retrying once with more output space");
                     req.max_tokens = (req.max_tokens * 2).min(MAX_TOKENS);
                     continue;
                 }
@@ -203,6 +238,11 @@ impl AiService {
             };
             log.input_tokens += c.input_tokens;
             log.output_tokens += c.output_tokens;
+            for w in c.web_sources {
+                if !log.web_sources.iter().any(|x| x.url == w.url) {
+                    log.web_sources.push(w);
+                }
+            }
             match serde_json::from_str::<T>(extract_json(&c.text)) {
                 Ok(v) => return Ok(v),
                 Err(e) => {
@@ -256,7 +296,8 @@ impl AiService {
                     system: prompts::VERIFY_SYSTEM.into(),
                     user,
                     schema: Some(prompts::verify_schema()),
-                    max_tokens: SHORT_TOKENS,
+                    max_tokens: DRAFT_TOKENS,
+                    fast: true,
                     ..Default::default()
                 },
                 log,
@@ -974,7 +1015,8 @@ impl AiService {
                         system: prompts::warning_system(cause_open),
                         user: req_user,
                         schema: Some(prompts::warning_schema()),
-                        max_tokens: SHORT_TOKENS,
+                        max_tokens: DRAFT_TOKENS,
+                        fast: true,
                         ..Default::default()
                     },
                     &mut log,
@@ -1052,19 +1094,39 @@ impl AiService {
     // ---------------------------------------------------------------- ask
 
     pub async fn ask(&self, sheet: Uuid, question: &str, more: bool) -> Result<AskAnswer> {
+        self.ask_with(sheet, question, more, &AskOptions::default()).await
+    }
+
+    pub async fn ask_with(&self, sheet: Uuid, question: &str, more: bool, opts: &AskOptions) -> Result<AskAnswer> {
         let question = question.trim();
         if question.is_empty() {
             return Err(CoreError::invalid("Type a question."));
+        }
+        if opts.knowledge == AskKnowledge::Web && !self.provider.supports_web() {
+            return Err(CoreError::invalid("Web search is not available with this AI provider. Choose general knowledge, or this A3 only."));
         }
         self.ensure_enabled(sheet).await?;
         let mut log = RunLog::default();
         let ctx = context::build(
             self.repo.as_ref(),
             sheet,
-            &ContextOptions { terms: question.to_string(), ask_history: true, ..Default::default() },
+            &ContextOptions { terms: question.to_string(), ask_history: opts.memory, history_since: opts.since, ..Default::default() },
         )
         .await?;
+        // A question the user has asked before gets a different explanation, not the same words again.
+        let repeat = if opts.memory {
+            let earlier = self.repo.messages(sheet).await?;
+            is_repeat(question, earlier.iter().filter(|m| opts.since.is_none_or(|s| m.created_at > s)))
+        } else {
+            false
+        };
+        let hint = match (repeat, more) {
+            (true, true) => "<repeat_question>The user wants more on a question already answered. Add what the earlier answer left out and do not restate it.</repeat_question>\n",
+            (true, false) => "<repeat_question>The user has asked this before and the earlier answer is in <ask_history>. Do not restate it. Explain again from a different angle, in different words, with a different structure or a concrete example.</repeat_question>\n",
+            _ => "",
+        };
         let words = if more { 150 } else { 60 };
+        let open = opts.knowledge.is_open();
         #[derive(Deserialize)]
         struct Src {
             id: String,
@@ -1074,18 +1136,31 @@ impl AiService {
         struct R {
             answer: String,
             sources: Vec<Src>,
+            #[serde(default)]
+            background: String,
         }
-        let user = format!("{}\nQuestion: <question>{}</question>", ctx.text, question.replace("</", "<\\/"));
-        let reply = self
-            .call_json::<R>(
-                CompletionRequest { system: prompts::ask_system(words), user, schema: Some(prompts::ask_schema()), max_tokens: SHORT_TOKENS, ..Default::default() },
-                &mut log,
-            )
-            .await;
-        let reply = match reply {
+        let user = format!("{}\n{hint}Question: <question>{}</question>", ctx.text, question.replace("</", "<\\/"));
+        let request = CompletionRequest {
+            system: prompts::ask_system(words, opts.knowledge),
+            user,
+            schema: Some(if open { prompts::ask_open_schema() } else { prompts::ask_schema() }),
+            max_tokens: match opts.knowledge {
+                AskKnowledge::A3Only => SHORT_TOKENS,
+                AskKnowledge::General => 3_000,
+                AskKnowledge::Web => 6_000,
+            },
+            web: opts.knowledge == AskKnowledge::Web,
+            ..Default::default()
+        };
+        let job = match opts.knowledge {
+            AskKnowledge::A3Only => "ask",
+            AskKnowledge::General => "ask_general",
+            AskKnowledge::Web => "ask_web",
+        };
+        let reply = match self.call_json::<R>(request, &mut log).await {
             Ok(r) => r,
             Err(e) => {
-                self.finish(Some(sheet), "ask", Some(&ctx), log, "failed").await;
+                self.finish(Some(sheet), job, Some(&ctx), log, "failed").await;
                 return Err(e);
             }
         };
@@ -1093,31 +1168,66 @@ impl AiService {
         let mut sources = Vec::new();
         for s in reply.sources {
             match ctx.resolve(&s.id) {
-                Some(c) if guard::quote_in_text(&s.quote, &c.text) => {
-                    sources.push(CitedSource { segment_id: c.segment_id, label: c.label, quote: s.quote })
-                }
+                Some(c) if guard::quote_in_text(&s.quote, &c.text) => sources.push(CitedSource {
+                    segment_id: c.segment_id,
+                    label: c.label,
+                    quote: s.quote,
+                    kind: a3_kind(),
+                    url: None,
+                }),
                 Some(_) => log.discard("G4", format!("quote not in {}", s.id)),
                 None => log.discard("G3", format!("unknown source id {}", s.id)),
             }
         }
-        let bad = guard::unsupported_tokens(&reply.answer, &format!("{}\n{question}", ctx.text));
-        let traced = !sources.is_empty() && bad.is_empty();
+        // G5 accepts only what the A3 holds. Outside knowledge from earlier turns is not evidence about it.
+        let bad = guard::unsupported_tokens(&reply.answer, &format!("{}\n{question}", context::evidence_text(&ctx.text)));
         if !bad.is_empty() {
             log.discard("G5", bad.join(", "));
         }
-        let (text, sources, has_more) = if traced {
-            let (t, cut) = limit_words(reply.answer.trim(), words);
-            (t, sources, cut || !more)
+        let a3_part = !reply.answer.trim().is_empty() && !sources.is_empty() && bad.is_empty();
+        // The background part is outside knowledge by design, so G3 to G5 do not apply to it. It is kept
+        // apart, labelled, and never mixed into the part that cites this A3.
+        let background = if open { reply.background.trim().to_string() } else { String::new() };
+
+        let (text, sources, background, cut) = if a3_part || !background.is_empty() {
+            let (text, cut) = if a3_part {
+                limit_words(reply.answer.trim(), words)
+            } else {
+                ("This A3 does not say anything about that.".to_string(), false)
+            };
+            let used = if a3_part { word_count(&text) } else { 0 };
+            let (bg, bg_cut) = limit_words(&background, words.saturating_sub(used).max(30));
+            (text, if a3_part { sources } else { Vec::new() }, bg, cut || bg_cut)
         } else {
             // Principle 3: if it cannot be traced, it is not shown.
-            ("I can't find that in this A3's content.".to_string(), Vec::new(), false)
+            ("I can't find that in this A3's content.".to_string(), Vec::new(), String::new(), false)
         };
+        let shown = a3_part || !background.is_empty();
+        let has_more = shown && (cut || !more);
+
+        // The stored form: A3 sources, then the background text, then the pages it came from.
+        let mut stored = sources.clone();
+        if !background.is_empty() {
+            let from_web = opts.knowledge == AskKnowledge::Web && !log.web_sources.is_empty();
+            stored.push(CitedSource {
+                segment_id: None,
+                label: if from_web { "Web search" } else { "General knowledge" }.into(),
+                quote: background,
+                kind: "background".into(),
+                url: None,
+            });
+            if from_web {
+                for w in log.web_sources.iter().take(5) {
+                    stored.push(CitedSource { segment_id: None, label: w.title.clone(), quote: String::new(), kind: "web".into(), url: Some(w.url.clone()) });
+                }
+            }
+        }
         self.repo.insert_message(sheet, "user", question, &json!([])).await?;
-        self.repo.insert_message(sheet, "assistant", &text, &json!(sources)).await?;
+        self.repo.insert_message(sheet, "assistant", &text, &json!(stored)).await?;
         if let Err(e) = self.roll_up_history(sheet, &mut log).await {
             log.discard("summary", e.message);
         }
-        self.finish(Some(sheet), "ask", Some(&ctx), log, "ok").await;
+        self.finish(Some(sheet), job, Some(&ctx), log, "ok").await;
         Ok(AskAnswer { text, sources, note: ctx.coverage, has_more })
     }
 
@@ -1222,6 +1332,7 @@ impl AiService {
                     schema: Some(prompts::vision_schema()),
                     max_tokens: MAX_TOKENS,
                     fast: false,
+                    web: false,
                 },
                 &mut log,
             )
@@ -1269,6 +1380,7 @@ pub async fn test_connection(provider: &dyn AiProvider) -> ConnectionTest {
         schema: Some(schema),
         max_tokens: 2000,
         fast: false,
+        web: false,
     };
     match provider.complete(&vreq).await {
         Ok(c) => {
@@ -1312,6 +1424,24 @@ pub fn check_rank(code: &str) -> i32 {
 
 fn two_sentences(text: &str) -> String {
     crate::domain::split_sentences(text).into_iter().take(2).collect::<Vec<_>>().join(" ")
+}
+
+/// Whether the user is asking again what they asked before: the same words, ignoring case and punctuation,
+/// or nearly so.
+fn is_repeat<'a>(question: &str, earlier: impl Iterator<Item = &'a AiMessage>) -> bool {
+    fn words(t: &str) -> HashSet<String> {
+        t.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect()
+    }
+    let now = words(question);
+    if now.is_empty() {
+        return false;
+    }
+    earlier.filter(|m| m.role == "user").any(|m| {
+        let then = words(&m.text);
+        let shared = now.intersection(&then).count() as f64;
+        let all = now.union(&then).count() as f64;
+        all > 0.0 && shared / all >= 0.75
+    })
 }
 
 fn limit_words(text: &str, max: usize) -> (String, bool) {
